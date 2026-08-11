@@ -1,0 +1,48 @@
+services:
+  mongo:
+    image: mongo:8.0
+    restart: unless-stopped
+    volumes:
+      - mongo_data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping')"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+
+  api:
+    build:
+      context: .
+      target: runtime
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    # No env_file needed: Compose already reads ./.env for the ${VAR:-default}
+    # interpolation below, so a missing .env just falls through to the defaults.
+    environment:
+      MONGO_URI: ${MONGO_URI:-mongodb://mongo:27017}
+      MONGO_DB: ${MONGO_DB:-chatbot}
+      LLM_PROVIDER: ${LLM_PROVIDER:-auto}
+      LLM_API_KEY: ${LLM_API_KEY:-}
+      LLM_BASE_URL: ${LLM_BASE_URL:-https://openrouter.ai/api/v1}
+      LLM_MODEL: ${LLM_MODEL:-google/gemma-4-26b-a4b-it:free}
+    depends_on:
+      mongo:
+        condition: service_healthy
+
+  tests:
+    build:
+      context: .
+      target: test
+    profiles: ["test"]
+    environment:
+      MONGO_URI: mongodb://mongo:27017
+      MONGO_DB: chatbot_test
+      LLM_PROVIDER: demo
+    depends_on:
+      mongo:
+        condition: service_healthy
+
+volumes:
+  mongo_data:

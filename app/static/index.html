@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>chatbot-fastapi-mongo</title>
+    <link rel="stylesheet" href="/style.css" />
+  </head>
+  <body>
+    <div id="banner" class="banner hidden"></div>
+    <div class="layout">
+      <aside class="sidebar">
+        <button id="new-chat" class="new-chat">+ New chat</button>
+        <ul id="conversation-list" class="conversation-list"></ul>
+      </aside>
+      <main class="chat">
+        <div id="empty-state" class="empty-state hidden">
+          Send a message to start a new conversation.
+        </div>
+        <div id="messages" class="messages"></div>
+        <form id="composer" class="composer">
+          <input
+            id="input"
+            type="text"
+            placeholder="Message..."
+            autocomplete="off"
+            maxlength="8000"
+          />
+          <button id="send" type="submit">Send</button>
+          <button id="stop" type="button" class="hidden">Stop</button>
+        </form>
+      </main>
+    </div>
+    <script src="/app.js"></script>
+  </body>
+</html>
