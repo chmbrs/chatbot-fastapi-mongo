@@ -3,17 +3,30 @@
 FROM python:3.13-slim AS builder
 COPY --from=ghcr.io/astral-sh/uv:0.9.26 /uv /uvx /bin/
 
+# Use the system Python across both stages (no managed-interpreter download),
+# precompile bytecode for faster container startup, and let a cache mount
+# survive across builds instead of re-downloading packages every time.
+ENV UV_PYTHON_DOWNLOADS=0 \
+    UV_COMPILE_BYTECODE=1 \
+    UV_LINK_MODE=copy
+
 WORKDIR /app
 COPY pyproject.toml uv.lock ./
 # Install deps only (no project code yet) so this layer is cached across code changes.
-RUN uv sync --frozen --no-install-project --no-dev
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv sync --locked --no-install-project --no-dev
 
 # Not needed at runtime, but the test stage (below) asserts every Settings
 # field is documented here — that check needs the file in the build context.
 COPY .env.example ./
 
 COPY app/ ./app/
-RUN uv sync --frozen --no-dev
+# pyproject.toml has no [build-system] table, so uv never installs this
+# project as a package regardless — this second sync is currently a no-op,
+# kept only so the step still does the right thing if a build-system is
+# ever added later.
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv sync --locked --no-dev
 
 
 FROM python:3.13-slim AS runtime
@@ -45,6 +58,7 @@ CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
 FROM builder AS test
 
 COPY tests/ ./tests/
-RUN uv sync --frozen
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv sync --locked
 
 CMD ["uv", "run", "pytest", "-v"]

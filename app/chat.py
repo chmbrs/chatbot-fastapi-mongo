@@ -187,13 +187,13 @@ class ChatService:
         return message
 
 
-def _derive_title(content: str, max_length: int = _TITLE_MAX_LENGTH) -> str:
+def _derive_title(content: str) -> str:
     content = content.strip()
     if not content:
         return DEFAULT_TITLE
-    if len(content) <= max_length:
+    if len(content) <= _TITLE_MAX_LENGTH:
         return content
-    truncated = content[:max_length]
+    truncated = content[:_TITLE_MAX_LENGTH]
     last_space = truncated.rfind(" ")
     if last_space > 0:
         truncated = truncated[:last_space]

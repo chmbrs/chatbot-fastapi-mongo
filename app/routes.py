@@ -10,6 +10,7 @@ from sse_starlette import EventSourceResponse
 from app.chat import DEFAULT_TITLE, ChatService, TurnDelta, TurnDone, TurnStarted
 from app.config import Settings, get_settings
 from app.errors import AppError, ConversationNotFound, error_envelope
+from app.llm.base import LLMClient
 from app.llm.openrouter import OpenRouterLLMClient
 from app.models import Conversation, Message
 from app.repository import Repository
@@ -29,8 +30,14 @@ def get_chat_service(request: Request) -> ChatService:
     return request.app.state.chat_service
 
 
-def get_llm(request: Request):
+def get_llm(request: Request) -> LLMClient:
     return request.app.state.llm
+
+
+RepositoryDep = Annotated[Repository, Depends(get_repository)]
+ChatServiceDep = Annotated[ChatService, Depends(get_chat_service)]
+SettingsDep = Annotated[Settings, Depends(get_settings)]
+LLMDep = Annotated[LLMClient, Depends(get_llm)]
 
 
 class CreateConversationBody(BaseModel):
@@ -46,11 +53,7 @@ class SendMessageBody(BaseModel):
 
 
 @router.get("/api/health")
-async def health(
-    repository: Repository = Depends(get_repository),
-    llm=Depends(get_llm),
-    settings: Settings = Depends(get_settings),
-):
+async def health(repository: RepositoryDep, llm: LLMDep, settings: SettingsDep):
     mongo_ok = await repository.ping()
     # isinstance, not llm.name == "openrouter": the "provider selected but no
     # key" placeholder client also names itself "openrouter" (see llm/__init__.py)
@@ -59,15 +62,16 @@ async def health(
 
     if not mongo_ok:
         degraded_reason = "mongo is unreachable"
-    elif not llm_is_real:
-        if settings.llm_provider == "demo":
-            degraded_reason = "LLM_PROVIDER=demo — using the offline provider by explicit choice"
-        elif not settings.llm_configured:
-            degraded_reason = "no LLM_API_KEY configured — using the offline demo provider"
-        else:
-            degraded_reason = "LLM_PROVIDER=openrouter but no LLM_API_KEY is set"
-    else:
+    elif llm_is_real:
         degraded_reason = None
+    elif settings.llm_provider == "demo":
+        degraded_reason = "LLM_PROVIDER=demo — using the offline provider by explicit choice"
+    elif settings.llm_provider == "openrouter":
+        degraded_reason = (
+            "LLM_PROVIDER=openrouter but no LLM_API_KEY is set — every message will fail"
+        )
+    else:  # "auto" with no key
+        degraded_reason = "no LLM_API_KEY configured — using the offline demo provider"
 
     return {
         "status": "ok" if (mongo_ok and llm_is_real) else "degraded",
@@ -83,9 +87,7 @@ async def health(
 
 @router.post("/api/conversations", status_code=201, response_model=Conversation)
 async def create_conversation(
-    body: CreateConversationBody,
-    repository: Repository = Depends(get_repository),
-    settings: Settings = Depends(get_settings),
+    body: CreateConversationBody, repository: RepositoryDep, settings: SettingsDep
 ):
     return await repository.create_conversation(
         title=body.title or DEFAULT_TITLE, model=settings.llm_model
@@ -93,14 +95,12 @@ async def create_conversation(
 
 
 @router.get("/api/conversations", response_model=list[Conversation])
-async def list_conversations(repository: Repository = Depends(get_repository)):
+async def list_conversations(repository: RepositoryDep):
     return await repository.list_conversations()
 
 
 @router.get("/api/conversations/{conversation_id}", response_model=Conversation)
-async def get_conversation(
-    conversation_id: ConversationId, repository: Repository = Depends(get_repository)
-):
+async def get_conversation(conversation_id: ConversationId, repository: RepositoryDep):
     conversation = await repository.get_conversation(conversation_id)
     if conversation is None:
         raise ConversationNotFound(conversation_id)
@@ -109,9 +109,7 @@ async def get_conversation(
 
 @router.patch("/api/conversations/{conversation_id}", response_model=Conversation)
 async def rename_conversation(
-    conversation_id: ConversationId,
-    body: RenameConversationBody,
-    repository: Repository = Depends(get_repository),
+    conversation_id: ConversationId, body: RenameConversationBody, repository: RepositoryDep
 ):
     renamed = await repository.rename_conversation(conversation_id, body.title)
     if not renamed:
@@ -120,18 +118,14 @@ async def rename_conversation(
 
 
 @router.delete("/api/conversations/{conversation_id}", status_code=204)
-async def delete_conversation(
-    conversation_id: ConversationId, repository: Repository = Depends(get_repository)
-):
+async def delete_conversation(conversation_id: ConversationId, repository: RepositoryDep):
     deleted = await repository.delete_conversation(conversation_id)
     if not deleted:
         raise ConversationNotFound(conversation_id)
 
 
 @router.get("/api/conversations/{conversation_id}/messages", response_model=list[Message])
-async def list_messages(
-    conversation_id: ConversationId, repository: Repository = Depends(get_repository)
-):
+async def list_messages(conversation_id: ConversationId, repository: RepositoryDep):
     conversation = await repository.get_conversation(conversation_id)
     if conversation is None:
         raise ConversationNotFound(conversation_id)
@@ -143,7 +137,7 @@ async def send_message(
     conversation_id: ConversationId,
     body: SendMessageBody,
     request: Request,
-    chat_service: ChatService = Depends(get_chat_service),
+    chat_service: ChatServiceDep,
 ):
     turn = chat_service.run_turn(conversation_id, body.content)
     if "text/event-stream" in request.headers.get("accept", ""):
@@ -153,9 +147,7 @@ async def send_message(
 
 @router.post("/api/conversations/{conversation_id}/retry")
 async def retry_message(
-    conversation_id: ConversationId,
-    request: Request,
-    chat_service: ChatService = Depends(get_chat_service),
+    conversation_id: ConversationId, request: Request, chat_service: ChatServiceDep
 ):
     turn = chat_service.retry_turn(conversation_id)
     if "text/event-stream" in request.headers.get("accept", ""):

@@ -59,6 +59,8 @@ class OpenRouterLLMClient:
                 model=self.model,
                 messages=messages,
                 stream=True,
+                # OpenRouter now includes usage in every response automatically;
+                # this is redundant but harmless back-compat, kept explicit.
                 stream_options={"include_usage": True},
             )
         except openai.AuthenticationError as exc:

@@ -6,7 +6,6 @@ from uuid import uuid4
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
-from fastapi.staticfiles import StaticFiles
 
 from app.chat import ChatService
 from app.config import Settings, get_settings
@@ -73,9 +72,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         )
 
     app.include_router(router)
-    # Mounted last: API routes always take precedence over static files —
-    # same container, same origin, so no CORS and no second service.
-    app.mount("/", StaticFiles(directory=STATIC_DIR, html=True), name="static")
+    # frontend() serves these as low-priority routes: API routes always take
+    # precedence regardless of registration order. Same container, same
+    # origin, so no CORS and no second service.
+    app.frontend("/", directory=STATIC_DIR)
     return app
 
 

@@ -8,7 +8,6 @@ import os
 import uuid
 
 import pytest
-import pytest_asyncio
 from fastapi.testclient import TestClient
 
 from app.config import Settings
@@ -20,7 +19,10 @@ def _mongo_uri() -> str:
     return os.environ.get("MONGO_URI", "mongodb://mongo:27017")
 
 
-@pytest_asyncio.fixture
+# Plain @pytest.fixture, not @pytest_asyncio.fixture: pyproject.toml's
+# asyncio_mode="auto" already manages async-generator fixtures the same way,
+# same as the sync `client` fixture below needs no special-casing either.
+@pytest.fixture
 async def repository():
     db_name = f"chatbot_test_{uuid.uuid4().hex[:8]}"
     client = create_client(_mongo_uri())

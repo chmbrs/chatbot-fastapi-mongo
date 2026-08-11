@@ -1,10 +1,13 @@
 from datetime import datetime
-from typing import Literal
+from typing import Annotated, Literal
 
-from pydantic import BaseModel
+from pydantic import BaseModel, BeforeValidator, Field
 
 MessageStatus = Literal["complete", "interrupted", "failed"]
 MessageRole = Literal["user", "assistant"]
+
+# Mongo gives back ObjectId, not str — coerce on the way in.
+MongoId = Annotated[str, BeforeValidator(str)]
 
 
 class MessageError(BaseModel):
@@ -13,16 +16,8 @@ class MessageError(BaseModel):
     retry_after_seconds: int | None = None
 
 
-def _without_mongo_id(doc: dict) -> dict:
-    """No `Field(alias="_id")`: FastAPI's response_model serialization
-    defaults to by_alias=True, which would otherwise leak `_id` straight
-    into JSON responses instead of the clean `id` field these models
-    declare — so the rename happens here, explicitly, once."""
-    return {**{k: v for k, v in doc.items() if k != "_id"}, "id": str(doc["_id"])}
-
-
 class Conversation(BaseModel):
-    id: str
+    id: MongoId = Field(validation_alias="_id", serialization_alias="id")
     title: str
     created_at: datetime
     updated_at: datetime
@@ -30,12 +25,12 @@ class Conversation(BaseModel):
 
     @classmethod
     def from_doc(cls, doc: dict) -> "Conversation":
-        return cls.model_validate(_without_mongo_id(doc))
+        return cls.model_validate(doc)
 
 
 class Message(BaseModel):
-    id: str
-    conversation_id: str
+    id: MongoId = Field(validation_alias="_id", serialization_alias="id")
+    conversation_id: MongoId
     role: MessageRole
     content: str
     status: MessageStatus
@@ -49,6 +44,4 @@ class Message(BaseModel):
 
     @classmethod
     def from_doc(cls, doc: dict) -> "Message":
-        data = _without_mongo_id(doc)
-        data["conversation_id"] = str(data["conversation_id"])
-        return cls.model_validate(data)
+        return cls.model_validate(doc)

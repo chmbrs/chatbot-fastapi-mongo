@@ -9,6 +9,4 @@ __pycache__
 .ruff_cache
 .venv
 venv
-README.md
-CLAUDE.md
 *.md
