@@ -253,6 +253,57 @@ async def test_the_assistant_row_is_on_disk_before_the_first_token(repository):
     await turn.aclose()
 
 
+async def test_a_turn_in_flight_is_live_and_the_row_it_wrote_still_says_interrupted(repository):
+    """The other half of the test above. That row reading `interrupted`
+    mid-stream is what makes the design honest, and it is also indistinguishable
+    from a turn that died -- for anyone reading the database, which is everyone
+    except the process actually writing it. `is_generating` is the process
+    saying so, and it is deliberately not persisted anywhere.
+    """
+    conv = await repository.create_conversation(title="t", model="fake")
+
+    class BlockingLLM:
+        name = "fake"
+        model = "fake-model"
+
+        async def stream(self, messages):
+            yield LLMChunk(text="first ")
+            await asyncio.sleep(10)
+
+    service = ChatService(repository, BlockingLLM())
+    turn = await service.run_turn(conv.id, "hi")
+    started = await anext(turn)
+
+    assert service.is_generating(started.assistant_message_id)
+    persisted = (await repository.list_messages(conv.id))[-1]
+    assert persisted.status == "interrupted"
+    assert persisted.live is False  # never comes off disk true
+
+    await turn.aclose()
+    assert not service.is_generating(started.assistant_message_id)
+
+
+async def test_liveness_ends_with_the_turn_however_the_turn_ends(repository):
+    """Complete, failed, and interrupted are three different exits from
+    _generate, and a flag that leaks on any one of them would leave a dead row
+    claiming to be mid-reply forever -- the same wrong caption this replaced,
+    only stuck.
+    """
+    conv = await repository.create_conversation(title="t", model="fake")
+
+    completed = ChatService(repository, FakeLLMClient(chunks=[LLMChunk(text="hi")]))
+    events = [event async for event in await completed.run_turn(conv.id, "hi")]
+    assert not completed.is_generating(events[0].assistant_message_id)
+
+    failing = ChatService(repository, FakeLLMClient(error=AppError("boom")))
+    turn = await failing.run_turn(conv.id, "again")
+    started = await anext(turn)
+    with pytest.raises(AppError):
+        async for _ in turn:
+            pass
+    assert not failing.is_generating(started.assistant_message_id)
+
+
 async def test_first_message_title_is_generated_by_the_llm(repository):
     """The title is the model's own summary now, not a truncation of the raw
     question: "In one short sentence, why use two collections instead of

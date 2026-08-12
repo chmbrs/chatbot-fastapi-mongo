@@ -72,6 +72,28 @@ class ChatService:
     def __init__(self, repository: Repository, llm: LLMClient):
         self._repository = repository
         self._llm = llm
+        # Assistant rows this process is generating *right now*. Deliberately
+        # in memory and nowhere else: the database records what happened, and
+        # a row that is mid-reply has already recorded the honest answer to
+        # that question (`interrupted`, see the module docstring). Whether one
+        # is still being written is a fact about a running process, not about
+        # the record, and it dies correctly with the process -- after a crash
+        # or a restart nothing is generating, and every such row then reads
+        # exactly what it is.
+        #
+        # Single-process by construction (one uvicorn worker, see Dockerfile).
+        # A second worker would need this shared, and switching providers
+        # mid-turn rebuilds this service (routes.py's set_llm_provider), so
+        # the turn already running loses its liveness and reads as
+        # interrupted until it settles -- both fail toward "not live", which
+        # is the direction that only ever understates what's happening.
+        self._in_flight: set[str] = set()
+
+    def is_generating(self, message_id: str) -> bool:
+        """Whether that assistant row is being written at this instant. The
+        one thing a reader cannot tell from the row itself: a turn in flight
+        and a turn stopped halfway are the same three fields on disk."""
+        return message_id in self._in_flight
 
     async def run_turn(self, conversation_id: str, content: str) -> AsyncIterator[StreamEvent]:
         """A coroutine that *returns* the stream, deliberately not an async
@@ -183,56 +205,64 @@ class ChatService:
             provider=self._llm.name,
             model=self._llm.model,
         )
-        yield TurnStarted(
-            conversation_id=conversation_id,
-            user_message_id=user_message_id,
-            assistant_message_id=assistant.id,
-        )
-
-        accumulated = ""
-        usage: dict | None = None
-        ttft_ms: int | None = None
-        started_at = time.monotonic()
-
-        async def settle(status: MessageStatus, error: AppError | None = None) -> Message | None:
-            # Closes over the accumulator deliberately: it reads whatever has
-            # streamed by the moment it's called, which is the whole job.
-            return await self._settle(
+        # Bracketing every exit below, including the ones that don't run their
+        # own cleanup: whatever happens, this row stops claiming to be live.
+        self._in_flight.add(assistant.id)
+        try:
+            yield TurnStarted(
                 conversation_id=conversation_id,
-                assistant_id=assistant.id,
-                status=status,
-                content=accumulated,
-                started_at=started_at,
-                ttft_ms=ttft_ms,
-                usage=usage,
-                error=error,
+                user_message_id=user_message_id,
+                assistant_message_id=assistant.id,
             )
 
-        # Three exits, three terminal states, and nothing else below this line.
-        try:
-            async for chunk in self._llm.stream(llm_messages):
-                if chunk.text:
-                    if ttft_ms is None:
-                        ttft_ms = int((time.monotonic() - started_at) * 1000)
-                    accumulated += chunk.text
-                    yield TurnDelta(text=chunk.text)
-                if chunk.usage is not None:
-                    usage = chunk.usage
-        except AppError as exc:
-            await settle("failed", error=exc)
-            raise
-        except (asyncio.CancelledError, GeneratorExit):
-            # Stop, or a closed tab. Two spellings of one event: a cancelled
-            # task raises CancelledError at the yield, a closed generator gets
-            # GeneratorExit. Best effort by design: the row already says
-            # `interrupted`, so this only adds the text that made it through,
-            # and if the disconnect tears us down first we lose the partial
-            # text, never the truth about what happened.
-            with suppress(Exception):
-                await settle("interrupted")
-            raise
+            accumulated = ""
+            usage: dict | None = None
+            ttft_ms: int | None = None
+            started_at = time.monotonic()
 
-        yield TurnDone(message=await settle("complete"))
+            async def settle(
+                status: MessageStatus, error: AppError | None = None
+            ) -> Message | None:
+                # Closes over the accumulator deliberately: it reads whatever
+                # has streamed by the moment it's called, which is the whole job.
+                return await self._settle(
+                    conversation_id=conversation_id,
+                    assistant_id=assistant.id,
+                    status=status,
+                    content=accumulated,
+                    started_at=started_at,
+                    ttft_ms=ttft_ms,
+                    usage=usage,
+                    error=error,
+                )
+
+            # Three exits, three terminal states, and nothing else below this line.
+            try:
+                async for chunk in self._llm.stream(llm_messages):
+                    if chunk.text:
+                        if ttft_ms is None:
+                            ttft_ms = int((time.monotonic() - started_at) * 1000)
+                        accumulated += chunk.text
+                        yield TurnDelta(text=chunk.text)
+                    if chunk.usage is not None:
+                        usage = chunk.usage
+            except AppError as exc:
+                await settle("failed", error=exc)
+                raise
+            except (asyncio.CancelledError, GeneratorExit):
+                # Stop, or a closed tab. Two spellings of one event: a cancelled
+                # task raises CancelledError at the yield, a closed generator gets
+                # GeneratorExit. Best effort by design: the row already says
+                # `interrupted`, so this only adds the text that made it through,
+                # and if the disconnect tears us down first we lose the partial
+                # text, never the truth about what happened.
+                with suppress(Exception):
+                    await settle("interrupted")
+                raise
+
+            yield TurnDone(message=await settle("complete"))
+        finally:
+            self._in_flight.discard(assistant.id)
 
     async def _settle(
         self,

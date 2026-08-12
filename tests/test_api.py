@@ -5,6 +5,7 @@ test_chat.py; this file is about the routes wiring: status codes, id
 validation, the dual JSON/SSE renderer, and health reporting.
 """
 
+import asyncio
 import json
 
 from fastapi.testclient import TestClient
@@ -13,6 +14,7 @@ from app.chat import ChatService
 from app.errors import AppError, RateLimited
 from app.llm.base import LLMChunk
 from app.main import create_app
+from app.routes import list_messages
 from tests.fakes import FakeLLMClient
 
 
@@ -185,6 +187,53 @@ def test_send_message_sse_mode_reports_failure_as_an_error_event_not_an_http_sta
     messages = client.get(f"/api/conversations/{conversation_id}/messages").json()
     assert messages[-1]["status"] == "failed"
     assert messages[-1]["content"] == "partial "
+
+
+async def test_a_reply_still_being_written_reads_live_and_stops_being_live_once_it_settles(
+    repository,
+):
+    """What a *second* reader sees while a turn is in flight — a reload, another
+    tab, or the UI polling for the receiving half of an @-send, which runs
+    server-side with no client attached at all. On disk that row is
+    `interrupted` with partial text, and read literally it says "this turn is
+    over and it was cut short", which is why the UI used to draw a Retry button
+    under a reply the model was still typing.
+
+    The route function directly, not through the TestClient: that client runs
+    the app to completion before handing back a streaming response, so no
+    request made through it can ever overlap a turn — the one condition this
+    test is about. Everything between here and HTTP is the same wiring every
+    other messages test in this file already exercises.
+    """
+    conversation = await repository.create_conversation(title="t", model="fake")
+
+    class BlockingLLM:
+        name = "fake"
+        model = "fake-model"
+
+        async def stream(self, messages):
+            yield LLMChunk(text="first ")
+            await asyncio.sleep(10)  # parked here for the assertions below
+
+    service = ChatService(repository, BlockingLLM())
+    turn = await service.run_turn(conversation.id, "hi")
+    await anext(turn)  # start
+    await anext(turn)  # a token has been delivered to the caller
+
+    during = await list_messages(conversation.id, repository, service)
+    assert during[-1].status == "interrupted"
+    assert during[-1].content == ""  # the second write hasn't happened yet
+    assert during[-1].live is True
+
+    await turn.aclose()
+
+    # The same row, now genuinely over: the two states differ on disk by
+    # nothing but the text that made it through, which is exactly why the
+    # reader needs to be told rather than left to infer.
+    after = await list_messages(conversation.id, repository, service)
+    assert after[-1].status == "interrupted"
+    assert after[-1].content == "first "
+    assert after[-1].live is False
 
 
 def test_conversations_and_messages_survive_a_restart(app_settings):

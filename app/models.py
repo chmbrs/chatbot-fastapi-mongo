@@ -74,6 +74,14 @@ class Message(BaseModel):
     total_ms: int | None = None
     peer: PeerInfo | None = None
     created_at: datetime
+    # Never stored, and never true straight out of the database. A reply that
+    # is still streaming sits on disk as `interrupted` with whatever text has
+    # arrived so far — by design (app/chat.py) — so the record alone cannot
+    # tell "still being written" from "stopped halfway". Only the running
+    # process knows, and routes.py's list_messages is where it says so. The
+    # default is the honest answer everywhere else, including after a restart:
+    # nothing is generating then.
+    live: bool = False
 
     @classmethod
     def from_doc(cls, doc: dict) -> "Message":

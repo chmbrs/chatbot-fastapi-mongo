@@ -148,7 +148,7 @@ If Ollama isn't running, or the model isn't pulled, you get told which; see
 
 ## Verify it works
 
-Eleven checks, in the order I'd run them:
+Twelve checks, in the order I'd run them:
 
 | # | Do this | Expect |
 |---|---|---|
@@ -163,6 +163,7 @@ Eleven checks, in the order I'd run them:
 | 9 | `docker compose stop mongo`, then `curl localhost:8000/api/health` | Still `200`, `"mongo": "unreachable"`: degraded, not down |
 | 10 | Two tabs, two conversations: click 🛰 on one and send to the other's handle | The reply appears in the other tab within ~2s, unprompted; the exchange volleys a few turns, then stops |
 | 11 | Set one conversation's inbound policy to `hold`, send to it | The message sits in that conversation's inbox until Approved or Denied; no turn runs until then |
+| 12 | While a reply nobody in this tab started is being written — the receiving side of check 10, or a reload mid-turn — watch that row | "Generating…", no Retry button, and it turns into the reply on its own. Compare `live` in `GET .../messages`: `true` only while it's being written. Check 8's genuinely interrupted row still shows `(interrupted)` and a Retry |
 
 Check 6 in full, if you'd rather not use `make`:
 
@@ -231,6 +232,18 @@ is the most useful thing in this README.
 Stop and a closed tab both land on `interrupted`, because the server genuinely cannot tell
 them apart. Saying so is more honest than inventing a distinction.
 
+**The cost of (2), and what it took to pay it.** A reply being written *right now* is on
+disk as `interrupted` too — that is the point — so anyone reading the transcript who isn't
+the caller that started the turn sees a row that says "cut short" about a model still
+typing. That is not an edge case: the receiving half of an [@-send](#-conversations-that-message-each-other)
+runs server-side with no client attached, so the UI polling for it hit this on every peer
+reply, drawing a Retry button under a live turn. The fix keeps the terminal states at
+three and adds nothing to the database: `GET .../messages` marks the rows this process is
+currently generating with `live: true`, from an in-memory set held by `ChatService`.
+Liveness is a fact about a running process, not about the record, and it dies correctly
+with the process — after a crash or a restart nothing is generating, and every such row
+then reads exactly what it is.
+
 ## Data model
 
 Three collections. Conversations and messages are **not** an embedded messages array:
@@ -248,6 +261,9 @@ messages       { _id, conversation_id, role: "user" | "assistant" | "peer", cont
 held_messages  { _id, to_conversation_id, from_conversation_id, from_handle, text,
                  hops, created_at }
 ```
+
+A message comes back over the API with one field that is not in the document above:
+`live`, filled in from process state at read time. Nothing writes it anywhere.
 
 **`handle` is computed, never stored**: `slugify(title) + "-" + id[-4:]`, e.g.
 `payments-api-3f0a`, the same way Claude Code names a session after its folder. That's
@@ -297,7 +313,7 @@ Restart persistence is the named volume `mongo_data:/data/db`.
 | `POST /api/conversations` | 201. |
 | `GET /api/conversations` | Sorted by `updated_at` desc; the projection never drags whole transcripts along. |
 | `GET/PATCH/DELETE /api/conversations/{id}` | `PATCH` renames: it exists so auto-generated titling (see [Decisions](#decisions-and-trade-offs)) reads as a choice rather than a limitation. `DELETE` cascades to messages first, then 204. |
-| `GET /api/conversations/{id}/messages` | Includes `failed` and `interrupted` messages. History is honest about what happened. |
+| `GET /api/conversations/{id}/messages` | Includes `failed` and `interrupted` messages. History is honest about what happened. Each row also carries `live`: `true` only while this process is generating it, which is the one thing the stored row cannot say (see [the turn lifecycle](#the-turn-lifecycle)). Never stored, never `true` after a restart. |
 | `POST /api/conversations/{id}/messages` | **One generator, two renderers.** `Accept: text/event-stream` gets SSE; anything else gets JSON with a real HTTP status. Streaming for the product, plain JSON for Swagger and curl, zero duplicated lifecycle logic. |
 | `POST /api/conversations/{id}/retry` | Drops a trailing `failed` or `interrupted` reply and re-enters the same generator. The working answer to "the reviewer's key hit 50/day mid-demo". |
 | `GET /api/agents` | The roster, mirroring Claude Code's `/list-agents`: every conversation, by handle. |

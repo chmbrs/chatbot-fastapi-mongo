@@ -25,6 +25,10 @@ the change needs more thought, not less.
   it's what makes the rest of the app testable without a real database.
 - `app/chat.py` must not import `fastapi` or `openai` directly; it depends only on
   the `LLMClient` Protocol in `app/llm/base.py`. That boundary is the test seam.
+- A reply that is still being written is `interrupted` on disk like any other, by design.
+  `live` on the API response (filled in by `routes.py`'s `list_messages` from an in-memory
+  set on `ChatService`) is how a reader tells the two apart. It is not a fourth
+  `MessageStatus`, and it is never written to Mongo; don't make it either one.
 - `app/peers.py` (conversation-to-conversation messaging) follows the same rule as
   `app/chat.py`: no `fastapi`, no `pymongo`. `held_messages` is its own collection
   rather than a fourth `MessageStatus`; don't fold it back into `messages`.

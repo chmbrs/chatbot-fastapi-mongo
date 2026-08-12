@@ -17,6 +17,7 @@ UIs are drawing on identical backend behavior, not a reimplementation of it.
 
 import json
 import os
+import re
 from collections.abc import Iterator
 
 import httpx
@@ -29,6 +30,60 @@ API_BASE_URL = os.environ.get("API_BASE_URL", "http://localhost:8000").rstrip("/
 _STREAM_TIMEOUT = httpx.Timeout(300.0, connect=10.0)
 
 st.set_page_config(page_title="chatbot-fastapi-mongo", page_icon="💬")
+
+# The one deliberate use of unsafe_allow_html in this file, and it is not the
+# boundary this file otherwise cares about: nothing here renders user- or
+# model-supplied content (that boundary is st.markdown(message["content"]),
+# and it stays exactly as unsafe_allow_html=False as ever). This is a static
+# layout fix with zero interpolated data, targeting one real, measured bug a
+# widget parameter cannot reach: a popover trigger with no icon or label of
+# its own -- the sidebar's ⌄-only "more actions" menu -- still renders
+# Streamlit's built-in chevron in a second flex slot sitting next to an empty
+# first one, and flex centering never lands it dead center.
+#
+# Measured with getBoundingClientRect in the browser, in order: zeroing the
+# gap between the two slots only closed part of the offset (an empty slot
+# still reserves width via its own span); hiding that empty slot outright
+# (:has(>span:empty), so a popover that *does* have an icon -- the header's
+# 🛰 send button -- is untouched) got the chevron down to one flex child, but
+# the button's own content box (padding: 4px 12px, border-box, minus a 1px
+# border) comes out *narrower than the 16px icon itself* -- so any flex
+# centering here is centering an overflowing box, which browsers don't
+# split evenly. `width: 100%` on the wrapper just inherited that same
+# too-small box instead of fixing it.
+#
+# Absolute positioning sidesteps the whole problem: centering by
+# `top/left: 50%` plus `translate(-50%, -50%)` is computed from the element's
+# own size against its containing block, never from how flex distributes
+# space among siblings, so it can't inherit an overflow asymmetry that isn't
+# there in the first place. `position: relative` on the button gives that
+# containing block.
+#
+# `stPopoverButton` is a testid Streamlit assigns intentionally, not one of
+# its generated (and unstable across versions) emotion-hash classes, which is
+# why the selectors below are keyed off that rather than a class name --
+# but that same emotion CSS outranks a same-specificity, later-in-source
+# override on a couple of these properties regardless, which is what the
+# `!important`s are for: not a style choice, the actual fix for that.
+st.markdown(
+    "<style>"
+    "button[data-testid='stPopoverButton'] { position: relative !important; }"
+    "button[data-testid='stPopoverButton'] > div > div:has(> span:empty) "
+    "{ display: none !important; }"
+    "button[data-testid='stPopoverButton'] > div > div[aria-hidden='true'] {"
+    "  position: absolute !important;"
+    "  top: 50% !important;"
+    "  left: 50% !important;"
+    # Horizontal came out exact (measured 5px/5px either side); vertical
+    # didn't (14px/10px) -- the icon glyph's own box isn't symmetric around
+    # its visual center, a font-metric quirk translate(-50%,-50%) alone
+    # doesn't know about. The extra -2px is that measured gap, halved,
+    # applied once: not a value that needs to react to anything at runtime.
+    "  transform: translate(-50%, calc(-50% - 2px)) !important;"
+    "}"
+    "</style>",
+    unsafe_allow_html=True,
+)
 
 
 class TurnFailed(Exception):
@@ -109,7 +164,26 @@ def stream_turn(path: str, json_body: dict | None = None) -> Iterator[str]:
         raise TurnFailed(f"Could not reach the API at {API_BASE_URL}: {exc}") from exc
 
 
-def _sidebar_label(title: str, limit: int = 28) -> str:
+def _with_thinking(slot, chunks: Iterator[str]) -> Iterator[str]:
+    """The same "Generating…" the transcript shows for a turn someone else
+    started, for the one case the transcript can't cover: this tab's own
+    in-flight turn, which isn't in the transcript yet and shows nothing at all
+    until the first token arrives. That gap is a whole model load with Ollama,
+    and an empty bubble is the one thing it shouldn't look like.
+
+    A wrapper around the chunk generator rather than anything st.write_stream
+    knows about: the first chunk is the only signal that the wait is over, and
+    it passes through here on its way to being rendered.
+    """
+    thinking = True
+    for chunk in chunks:
+        if thinking:
+            slot.empty()
+            thinking = False
+        yield chunk
+
+
+def _sidebar_label(title: str, limit: int = 20) -> str:
     """The backend's own title (up to 60 chars, see app/chat.py's
     _derive_title) is right for the header, where there's room, but wraps a
     sidebar row onto two or three lines, and a list where every row is a
@@ -187,11 +261,18 @@ def _resolve_mention(token: str, conversations: list[dict], self_id: str | None)
 def _composer_hint(conversations: list[dict], self_id: str | None) -> str:
     """The placeholder is the only teaching surface the composer has, so it
     names a real, current handle instead of the literal word "handle", which
-    read as an instruction to type "handle"."""
+    read as an instruction to type "handle".
+
+    "or" would describe the two @-mention forms as mutually exclusive with
+    messaging this chat, which is only true of the explicit `@handle text`
+    prefix (a send with no reply from this chat). A mention anywhere else in
+    an ordinary message still replies here *and* forwards that reply, so the
+    hint says "too" rather than presenting an either/or that no longer holds
+    for that second form."""
     others = _addressable(conversations, self_id)
     if not others:
         return "Message this chat"
-    return f"Message this chat, or @{others[0]['handle']} to send to another chat"
+    return f"Message this chat, or mention @{others[0]['handle']} to send there too"
 
 
 def _set_conversation(conversation_id: str | None) -> None:
@@ -208,6 +289,27 @@ def _delete_conversation(conversation_id: str) -> None:
     api("DELETE", f"/api/conversations/{conversation_id}")
     if st.session_state.conversation_id == conversation_id:
         _set_conversation(None)
+
+
+@st.dialog("Rename conversation")
+def _rename_dialog(conversation_id: str, current_title: str) -> None:
+    # Takes the id explicitly rather than closing over the selected
+    # conversation: this is opened from the sidebar's per-row menu too, for
+    # rows that are not the open conversation, and a version that assumed
+    # "the dialog's target is whatever's selected" would rename the wrong one.
+    new_title = st.text_input("Title", value=current_title)
+    if st.button("Save", icon=":material/check:", type="primary") and new_title.strip():
+        # Every other write in this file goes through the same TurnFailed ->
+        # st.error path (see api()'s docstring); this dialog was the one
+        # place that let a plain 404 -- e.g. the conversation was deleted
+        # elsewhere between opening this dialog and saving it -- fall through
+        # to Streamlit's raw traceback box instead.
+        try:
+            api("PATCH", f"/api/conversations/{conversation_id}", json={"title": new_title})
+        except TurnFailed as exc:
+            st.error(str(exc))
+        else:
+            st.rerun()
 
 
 def _set_llm_provider() -> None:
@@ -310,10 +412,20 @@ def _watch_for_peer_activity(conversation_id: str) -> None:
     if st.session_state.streaming:
         return
     try:
-        latest = api("GET", f"/api/conversations/{conversation_id}/messages")[-1]
-    except (TurnFailed, IndexError):
+        messages = api("GET", f"/api/conversations/{conversation_id}/messages")
+    except TurnFailed:
         return  # a poll that fails is not an error the user caused
-    seen = (latest["id"], latest["status"])
+    # Every row, not just the last one, and the whole GET was already being
+    # paid for either way. A hop-limited exchange can have an earlier reply
+    # finish while a later one is still being written, and watching only the
+    # tail left the finished one drawn as "Generating…" until the tail
+    # happened to change too.
+    #
+    # `live` sits in here next to status because the two are one fact: a turn
+    # that stops halfway settles from live-and-`interrupted` to plain
+    # `interrupted`, which is a status that did not change and a meaning that
+    # did.
+    seen = tuple((m["id"], m["status"], m["live"]) for m in messages)
     # Record what was seen *before* rerunning, not after: st.rerun() raises
     # immediately, so an assignment placed after it never runs, last_seen
     # stays stale, and the next pass sees the same change and reruns again --
@@ -374,37 +486,81 @@ with st.sidebar:
     if health["status"] != "ok":
         st.warning(health["llm"]["degraded_reason"])
 
-    st.button(
-        "New chat",
-        icon=":material/add:",
-        on_click=_set_conversation,
-        args=(None,),
-        width="stretch",
-    )
-    st.divider()
+    # A fixed-height container rather than a plain button: st.divider()'s own
+    # margin used to leave a stretch of dead space between the button and the
+    # list below it. Giving that height to the button's own container -- and
+    # dropping the divider that was creating it -- turns that space into part
+    # of the button instead of padding next to it.
+    with st.container(height=80, border=False, vertical_alignment="center"):
+        st.button(
+            "New chat",
+            icon=":material/add:",
+            on_click=_set_conversation,
+            args=(None,),
+            width="stretch",
+        )
 
     for conversation in conversations:
-        row = st.columns([5, 1], vertical_alignment="center")
+        # A single flat row per conversation, closer to a chat client's own
+        # list: the title button's rounded pill is the only surface -- no
+        # outer card stacked around it -- with the ⋮ menu beside it instead
+        # of a third icon of equal weight competing with the title.
+        #
+        # The handle used to live here too, always visible, then moved to a
+        # hover tooltip on the title button, then off the row entirely -- it
+        # only lives in the ⋮ menu now. Nothing that needed it lost it: the
+        # peer popover's "Send to" list already spells out every reachable
+        # handle at the one place this app actually asks anyone to type one.
+        # gap=0: the closest native approximation of "one unified row" without
+        # the custom CSS this file otherwise avoids (see _peer_popover's note
+        # on st.code's built-in copy icon for the same reasoning) -- the title
+        # and the ⋮ trigger are still two separate widgets, but they now sit
+        # flush against each other instead of visibly separated.
+        row = st.columns([5, 1], vertical_alignment="center", gap=0)
         row[0].button(
             _sidebar_label(conversation["title"]),
+            icon=":material/chat_bubble:",
             key=f"select-{conversation['id']}",
             type="primary" if conversation["id"] == conversation_id else "secondary",
             width="stretch",
             on_click=_set_conversation,
             args=(conversation["id"],),
         )
-        row[1].button(
-            "",
-            icon=":material/delete:",
-            help="Delete conversation",
-            key=f"delete-{conversation['id']}",
-            on_click=_delete_conversation,
-            args=(conversation["id"],),
-        )
-        # The address, next to the thing it addresses. Without this the only
-        # place a handle appeared was a caption for the chat you were already
-        # in, which is the one chat you can't message.
-        row[0].caption(f"@{conversation['handle']}")
+        # st.popover, not a session_state toggle: a toggle's opened content is
+        # just more elements in the sidebar's own vertical flow, so opening
+        # one row's menu pushed every row below it down the list -- worse
+        # than the thing it was trying to fix. A popover floats above the
+        # list instead and costs nothing else on the page while closed.
+        #
+        # No icon on the trigger: a popover always draws its own trailing
+        # chevron regardless (baked into the widget, no parameter turns it
+        # off), so leaving `icon` unset renders that chevron alone instead of
+        # stacking a kebab icon in front of it.
+        #
+        # `key=` still matters for the reason it always did in a loop like
+        # this: every row's trigger has byte-identical visible args (empty
+        # label, no icon), so without an id-derived key Streamlit can only
+        # tell rows apart by position, and a list reorder (a delete, a
+        # resort) would hand row N's popover identity to whatever
+        # conversation shifted into that slot next.
+        with row[1].popover("", key=f"more-{conversation['id']}"):
+            st.caption(f"@{conversation['handle']}")
+            st.divider()
+            if st.button(
+                "Rename",
+                icon=":material/edit:",
+                key=f"rename-{conversation['id']}",
+                width="stretch",
+            ):
+                _rename_dialog(conversation["id"], conversation["title"])
+            st.button(
+                "Delete conversation",
+                icon=":material/delete:",
+                key=f"delete-{conversation['id']}",
+                on_click=_delete_conversation,
+                args=(conversation["id"],),
+                width="stretch",
+            )
 
 
 # --- main pane ---------------------------------------------------------------
@@ -424,13 +580,6 @@ else:
     header[0].subheader(conversation["title"])
     st.caption(f"@{conversation['handle']}")
 
-    @st.dialog("Rename conversation")
-    def _rename_dialog(current_title: str) -> None:
-        new_title = st.text_input("Title", value=current_title)
-        if st.button("Save", icon=":material/check:", type="primary") and new_title.strip():
-            api("PATCH", f"/api/conversations/{conversation_id}", json={"title": new_title})
-            st.rerun()
-
     # on_change="rerun" (lazy content, computed only while open) was tried
     # first and dropped: it doubled the header row's buttons in the DOM on
     # the very first script pass, before the popover was ever opened. The
@@ -440,7 +589,7 @@ else:
         _peer_popover(conversation, conversations)
 
     if header[2].button("", icon=":material/edit:", help="Rename conversation"):
-        _rename_dialog(conversation["title"])
+        _rename_dialog(conversation_id, conversation["title"])
 
     # A fixed height keeps the header, the 🛰 popover and the handle above
     # always visible and always reachable, with only the transcript itself
@@ -483,16 +632,23 @@ else:
             avatar = "🛰" if message["role"] == "peer" else None
             with st.chat_message(message["role"], avatar=avatar):
                 if message["role"] == "peer":
-                    st.caption(
-                        f"from @{message['peer']['from_handle']} · hop {message['peer']['hops']}"
-                    )
+                    st.caption(f"from @{message['peer']['from_handle']}")
                 # Streamlit's markdown renderer has unsafe_allow_html off by
                 # default, so this holds the same XSS boundary the old
                 # textContent-only frontend documented as a deliberate choice,
                 # just with markdown formatting now rendering, which that one
                 # didn't have.
                 st.markdown(message["content"] or ("…" if message["status"] != "failed" else ""))
-                if message["role"] == "assistant" and message["status"] != "complete":
+                if message["live"]:
+                    # Being written right now (see list_messages in
+                    # app/routes.py). The row underneath says `interrupted`
+                    # and will keep saying it until the last token lands, so
+                    # without this flag a reply nobody in this tab started --
+                    # the whole receiving half of an @-send, which runs
+                    # server-side -- rendered as a dead turn, under a Retry
+                    # button, while the model was still typing it.
+                    st.caption("Generating…")
+                elif message["role"] == "assistant" and message["status"] != "complete":
                     st.caption(
                         message["error"]["message"] if message["error"] else "(interrupted)"
                     )
@@ -522,7 +678,13 @@ else:
             st.session_state.streaming = True
             try:
                 with st.chat_message("assistant"):
-                    st.write_stream(stream_turn(f"/api/conversations/{conversation_id}/retry"))
+                    thinking = st.empty()
+                    thinking.caption("Generating…")
+                    st.write_stream(
+                        _with_thinking(
+                            thinking, stream_turn(f"/api/conversations/{conversation_id}/retry")
+                        )
+                    )
             except TurnFailed as exc:
                 st.error(str(exc))
             finally:
@@ -587,7 +749,18 @@ if prompt:
             except TurnFailed as exc:
                 st.session_state.peer_error = str(exc)
     else:
-        st.session_state.peer_error = None
+        # A mention anywhere in an ordinary message — as opposed to the
+        # explicit "@handle text" send above, which is never a chat turn —
+        # doesn't send by itself. It marks this turn's own reply, once
+        # generated, for forwarding: "generate a number, then send it to
+        # @x" works as one natural sentence instead of two turns.
+        mention = re.search(r"@[\w-]+", prompt)
+        forward_handle, forward_error = (
+            _resolve_mention(mention.group(0), conversations, target_id)
+            if mention
+            else (None, None)
+        )
+        st.session_state.peer_error = forward_error
         st.session_state.peer_notice = None
         target = live_turn.container() if live_turn is not None else st.container()
 
@@ -595,15 +768,32 @@ if prompt:
             with st.chat_message("user"):
                 st.markdown(prompt)
             st.session_state.streaming = True
+            reply_text = None
             try:
                 with st.chat_message("assistant"):
-                    st.write_stream(
-                        stream_turn(
-                            f"/api/conversations/{target_id}/messages", {"content": prompt}
+                    thinking = st.empty()
+                    thinking.caption("Generating…")
+                    reply_text = st.write_stream(
+                        _with_thinking(
+                            thinking,
+                            stream_turn(
+                                f"/api/conversations/{target_id}/messages", {"content": prompt}
+                            ),
                         )
                     )
             except TurnFailed as exc:
                 st.error(str(exc))
             finally:
                 st.session_state.streaming = False
+
+            if forward_handle and reply_text and reply_text.strip():
+                # Unlike the explicit "@handle text" send above, this turn
+                # already rendered a real, persisted user message and assistant
+                # reply above — setting peer_notice here would draw a second,
+                # fake "sent to @X" bubble repeating the reply already on screen.
+                try:
+                    delivery = _send_peer_message(target_id, forward_handle, reply_text.strip())
+                    st.toast(f"{delivery['outcome']} → @{forward_handle}", icon="🛰")
+                except TurnFailed as exc:
+                    st.session_state.peer_error = str(exc)
     st.rerun()

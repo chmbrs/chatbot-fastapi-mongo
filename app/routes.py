@@ -190,11 +190,21 @@ async def delete_conversation(conversation_id: ConversationId, repository: Repos
 
 
 @router.get("/api/conversations/{conversation_id}/messages", response_model=list[Message])
-async def list_messages(conversation_id: ConversationId, repository: RepositoryDep):
+async def list_messages(
+    conversation_id: ConversationId, repository: RepositoryDep, chat_service: ChatServiceDep
+):
+    """The one read that mixes stored state with process state. A turn that is
+    generating right now is `interrupted` with partial content on disk, which
+    is the correct thing to have persisted (see chat.py) but reads, to anyone
+    who wasn't the caller that started it, exactly like a turn that died. A
+    peer exchange runs server-side with no client attached at all, so that is
+    the normal case, not an edge one. `live` is that missing bit, filled in
+    from the process rather than the record and never written back to it."""
     conversation = await repository.get_conversation(conversation_id)
     if conversation is None:
         raise ConversationNotFound(conversation_id)
-    return await repository.list_messages(conversation_id)
+    messages = await repository.list_messages(conversation_id)
+    return [m.model_copy(update={"live": chat_service.is_generating(m.id)}) for m in messages]
 
 
 # --- peer messaging (see app/peers.py) --------------------------------------
