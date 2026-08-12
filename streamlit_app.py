@@ -183,7 +183,7 @@ def _with_thinking(slot, chunks: Iterator[str]) -> Iterator[str]:
         yield chunk
 
 
-def _sidebar_label(title: str, limit: int = 20) -> str:
+def _sidebar_label(title: str, limit: int = 28) -> str:
     """The backend's own title (up to 60 chars, see app/chat.py's
     _derive_title) is right for the header, where there's room, but wraps a
     sidebar row onto two or three lines, and a list where every row is a
@@ -192,6 +192,13 @@ def _sidebar_label(title: str, limit: int = 20) -> str:
     length that actually fits one line, so every row in the list stands the
     same height. The full title is never lost; only this one label is
     shortened, and the header still shows it in full.
+
+    28, not some rounder number, because it was measured, not guessed: with
+    the sidebar's actual button padding and font, a handful of realistic
+    titles (the backend's own 3-6-word style, and a few much longer ones)
+    all stayed within the row's available label width at 28 and several
+    started overflowing to a second line at 29. Rounding down from a
+    measurement beats rounding up from a guess.
     """
     if len(title) <= limit:
         return title
@@ -259,9 +266,16 @@ def _resolve_mention(token: str, conversations: list[dict], self_id: str | None)
 
 
 def _composer_hint(conversations: list[dict], self_id: str | None) -> str:
-    """The placeholder is the only teaching surface the composer has, so it
-    names a real, current handle instead of the literal word "handle", which
-    read as an instruction to type "handle".
+    """The placeholder is the only teaching surface the composer has, but it
+    doesn't name a real, current handle any more (it used to show
+    others[0]) -- a title-derived slug is only ever meant to be read once
+    you already know which conversation you're looking at, so surfacing an
+    arbitrary *other* one's here, out of context, just reads as noise (worse
+    when that title is a sentence fragment, e.g. "something-is-coming-your-
+    7f60"). The literal word "handle" was tried before that and read as an
+    instruction to type "handle" -- this sidesteps both failure modes by not
+    naming anything: the conversation you actually want is one click away
+    (open it, its own handle is right under its title).
 
     "or" would describe the two @-mention forms as mutually exclusive with
     messaging this chat, which is only true of the explicit `@handle text`
@@ -272,7 +286,7 @@ def _composer_hint(conversations: list[dict], self_id: str | None) -> str:
     others = _addressable(conversations, self_id)
     if not others:
         return "Message this chat"
-    return f"Message this chat, or mention @{others[0]['handle']} to send there too"
+    return "Message this chat, or @mention another conversation to send there too"
 
 
 def _set_conversation(conversation_id: str | None) -> None:
@@ -543,7 +557,14 @@ with st.sidebar:
         # tell rows apart by position, and a list reorder (a delete, a
         # resort) would hand row N's popover identity to whatever
         # conversation shifted into that slot next.
-        with row[1].popover("", key=f"more-{conversation['id']}"):
+        #
+        # width="stretch": a popover defaults to sizing itself to its content
+        # ("content" is st.popover's own default, unlike st.button elsewhere
+        # in this file), so with no icon or label left to size around, it
+        # rendered narrower than its column and sat short of the column's own
+        # right edge -- the row stopped short of where "New chat" reaches,
+        # instead of the two lining up.
+        with row[1].popover("", key=f"more-{conversation['id']}", width="stretch"):
             st.caption(f"@{conversation['handle']}")
             st.divider()
             if st.button(
