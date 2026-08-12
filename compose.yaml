@@ -28,7 +28,8 @@ services:
       LLM_BASE_URL: ${LLM_BASE_URL:-https://openrouter.ai/api/v1}
       LLM_MODEL: ${LLM_MODEL:-google/gemma-4-26b-a4b-it:free}
       OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://host.docker.internal:11434/v1}
-      OLLAMA_MODEL: ${OLLAMA_MODEL:-llama3.2}
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-gemma4:latest}
+      PEER_HOP_LIMIT: ${PEER_HOP_LIMIT:-3}
     # Ollama runs on the host, not in this network. Docker Desktop resolves
     # host.docker.internal already; Linux needs it mapped explicitly, and the
     # mapping is harmless where it's redundant.
@@ -36,6 +37,22 @@ services:
       - "host.docker.internal:host-gateway"
     depends_on:
       mongo:
+        condition: service_healthy
+
+  web:
+    build:
+      context: .
+      target: ui
+    restart: unless-stopped
+    ports:
+      - "8501:8501"
+    environment:
+      # api, not localhost: this is a server-to-server call over the compose
+      # network, from Streamlit's Python backend, never from the browser,
+      # so it needs no CORS entry on the api service either.
+      API_BASE_URL: ${API_BASE_URL:-http://api:8000}
+    depends_on:
+      api:
         condition: service_healthy
 
   tests:

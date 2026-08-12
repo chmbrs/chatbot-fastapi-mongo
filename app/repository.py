@@ -14,7 +14,7 @@ from bson.errors import InvalidId
 from pymongo import AsyncMongoClient, ReturnDocument
 from pymongo.errors import PyMongoError
 
-from app.models import Conversation, Message, MessageStatus
+from app.models import Conversation, HeldMessage, InboundPolicy, Message, MessageStatus
 
 # The _id tiebreak is not decoration. BSON datetimes are millisecond-precision,
 # and a user message plus its reply routinely land in the *same* millisecond
@@ -25,6 +25,7 @@ from app.models import Conversation, Message, MessageStatus
 # they increase monotonically in exactly the order the rows were created.
 _OLDEST_FIRST = [("created_at", 1), ("_id", 1)]
 _NEWEST_FIRST = [("updated_at", -1), ("_id", -1)]
+_HELD_OLDEST_FIRST = [("created_at", 1), ("_id", 1)]
 
 
 def create_client(mongo_uri: str) -> AsyncMongoClient:
@@ -37,6 +38,7 @@ class Repository:
         db = client[db_name]
         self.conversations = db["conversations"]
         self.messages = db["messages"]
+        self.held_messages = db["held_messages"]
 
     async def ensure_indexes(self, retries: int = 10, delay_seconds: float = 1.0) -> None:
         """Idempotent, with a bounded retry: a cold `docker compose up` can
@@ -53,6 +55,11 @@ class Repository:
                 # index scan instead of an in-memory SORT stage.
                 await self.messages.create_index(
                     [("conversation_id", 1), ("created_at", 1), ("_id", 1)]
+                )
+                # Serves both "this conversation's inbox" and its cascade
+                # delete's prefix — same rule as the messages index above.
+                await self.held_messages.create_index(
+                    [("to_conversation_id", 1), ("created_at", 1), ("_id", 1)]
                 )
                 return
             except PyMongoError as exc:
@@ -90,6 +97,13 @@ class Repository:
         result = await self.conversations.update_one({"_id": oid}, {"$set": {"title": title}})
         return result.matched_count > 0
 
+    async def set_inbound_policy(self, conversation_id: str, policy: InboundPolicy) -> bool:
+        oid = _parse_id(conversation_id)
+        if oid is None:
+            return False
+        result = await self.conversations.update_one({"_id": oid}, {"$set": {"inbound": policy}})
+        return result.matched_count > 0
+
     async def touch_conversation(self, conversation_id: str) -> None:
         oid = _parse_id(conversation_id)
         if oid is None:
@@ -105,6 +119,7 @@ class Repository:
         # Cascade first: an orphaned conversation with no messages is
         # recoverable to look at; orphaned messages with no conversation are not.
         await self.messages.delete_many({"conversation_id": oid})
+        await self.held_messages.delete_many({"to_conversation_id": oid})
         result = await self.conversations.delete_one({"_id": oid})
         return result.deleted_count > 0
 
@@ -172,6 +187,62 @@ class Repository:
             return True
         except PyMongoError:
             return False
+
+    # --- held messages (see app/peers.py) -------------------------------------
+
+    async def insert_held_message(
+        self,
+        to_conversation_id: str,
+        from_conversation_id: str,
+        from_handle: str,
+        text: str,
+        hops: int,
+    ) -> HeldMessage | None:
+        to_oid = _parse_id(to_conversation_id)
+        if to_oid is None:
+            return None
+        doc = {
+            "to_conversation_id": to_oid,
+            "from_conversation_id": from_conversation_id,
+            "from_handle": from_handle,
+            "text": text,
+            "hops": hops,
+            "created_at": datetime.now(UTC),
+        }
+        result = await self.held_messages.insert_one(doc)
+        doc["_id"] = result.inserted_id
+        return HeldMessage.from_doc(doc)
+
+    async def list_held_messages(self, to_conversation_id: str) -> list[HeldMessage]:
+        oid = _parse_id(to_conversation_id)
+        if oid is None:
+            return []
+        cursor = self.held_messages.find({"to_conversation_id": oid}).sort(_HELD_OLDEST_FIRST)
+        return [HeldMessage.from_doc(doc) async for doc in cursor]
+
+    async def get_held_message(
+        self, to_conversation_id: str, held_id: str
+    ) -> HeldMessage | None:
+        to_oid = _parse_id(to_conversation_id)
+        held_oid = _parse_id(held_id)
+        if to_oid is None or held_oid is None:
+            return None
+        doc = await self.held_messages.find_one(
+            {"_id": held_oid, "to_conversation_id": to_oid}
+        )
+        return HeldMessage.from_doc(doc) if doc else None
+
+    async def delete_held_message(self, to_conversation_id: str, held_id: str) -> bool:
+        to_oid = _parse_id(to_conversation_id)
+        held_oid = _parse_id(held_id)
+        if to_oid is None or held_oid is None:
+            return False
+        # Scoped by both ids, same rule as delete_message: a deny can never
+        # cross a conversation boundary.
+        result = await self.held_messages.delete_one(
+            {"_id": held_oid, "to_conversation_id": to_oid}
+        )
+        return result.deleted_count > 0
 
 
 def _parse_id(value: str) -> ObjectId | None:

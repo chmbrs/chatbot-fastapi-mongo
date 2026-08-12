@@ -142,6 +142,13 @@ def _delete_conversation(conversation_id: str) -> None:
         _set_conversation(None)
 
 
+def _set_llm_provider() -> None:
+    # on_change: Streamlit already wrote the new value to session_state under
+    # this key before calling back, so it's read here rather than passed in.
+    provider = "ollama" if st.session_state["use-ollama"] else "demo"
+    api("PUT", "/api/settings/llm-provider", json={"provider": provider})
+
+
 def _request_retry(conversation_id: str) -> None:
     # on_click callbacks run before the script body and can't render
     # anything (they execute as a prefix to the rerun, per Streamlit's
@@ -266,6 +273,20 @@ conversation_id = st.session_state.conversation_id
 # --- sidebar ----------------------------------------------------------------
 
 with st.sidebar:
+    # Only when no key is set: a real key already answers "which provider",
+    # and this app never silently overrides one (see /api/health's
+    # has_api_key and the guard in set_llm_provider, app/routes.py).
+    if not health["llm"]["has_api_key"]:
+        st.toggle(
+            "Use local Ollama model",
+            value=health["llm"]["provider"] == "ollama",
+            key="use-ollama",
+            on_change=_set_llm_provider,
+            help="No LLM_API_KEY is configured, so this app is running either "
+            "the offline demo provider or a local Ollama model. Off is the "
+            "demo, on is Ollama, no restart needed either way.",
+        )
+
     if health["status"] != "ok":
         st.warning(health["llm"]["degraded_reason"])
 
@@ -328,43 +349,54 @@ else:
     if header[2].button("", icon=":material/edit:", help="Rename conversation"):
         _rename_dialog(conversation["title"])
 
-    messages = api("GET", f"/api/conversations/{conversation_id}/messages")
-    for index, message in enumerate(messages):
-        avatar = "🛰" if message["role"] == "peer" else None
-        with st.chat_message(message["role"], avatar=avatar):
-            if message["role"] == "peer":
-                st.caption(f"from @{message['peer']['from_handle']} · hop {message['peer']['hops']}")
-            # Streamlit's markdown renderer has unsafe_allow_html off by
-            # default, so this holds the same XSS boundary the old
-            # textContent-only frontend documented as a deliberate choice,
-            # just with markdown formatting now rendering, which that one
-            # didn't have.
-            st.markdown(message["content"] or ("…" if message["status"] != "failed" else ""))
-            if message["role"] == "assistant" and message["status"] != "complete":
-                st.caption(message["error"]["message"] if message["error"] else "(interrupted)")
-                # Only the last message: /retry always regenerates the
-                # trailing reply, so the button would be misleading anywhere
-                # else in the transcript.
-                if index == len(messages) - 1:
-                    st.button(
-                        "Retry",
-                        icon=":material/refresh:",
-                        key=f"retry-{message['id']}",
-                        on_click=_request_retry,
-                        args=(conversation_id,),
+    # A fixed height keeps the header, the 🛰 popover and the handle above
+    # always visible and always reachable, with only the transcript itself
+    # scrolling. st.chat_message children get autoscroll-to-latest for
+    # free (see st.container's docs) -- which matters more here than in a
+    # single-user chat, since a peer exchange can add several rows in the
+    # time it takes to glance away and back.
+    with st.container(height=450):
+        messages = api("GET", f"/api/conversations/{conversation_id}/messages")
+        for index, message in enumerate(messages):
+            avatar = "🛰" if message["role"] == "peer" else None
+            with st.chat_message(message["role"], avatar=avatar):
+                if message["role"] == "peer":
+                    st.caption(
+                        f"from @{message['peer']['from_handle']} · hop {message['peer']['hops']}"
                     )
+                # Streamlit's markdown renderer has unsafe_allow_html off by
+                # default, so this holds the same XSS boundary the old
+                # textContent-only frontend documented as a deliberate choice,
+                # just with markdown formatting now rendering, which that one
+                # didn't have.
+                st.markdown(message["content"] or ("…" if message["status"] != "failed" else ""))
+                if message["role"] == "assistant" and message["status"] != "complete":
+                    st.caption(
+                        message["error"]["message"] if message["error"] else "(interrupted)"
+                    )
+                    # Only the last message: /retry always regenerates the
+                    # trailing reply, so the button would be misleading
+                    # anywhere else in the transcript.
+                    if index == len(messages) - 1:
+                        st.button(
+                            "Retry",
+                            icon=":material/refresh:",
+                            key=f"retry-{message['id']}",
+                            on_click=_request_retry,
+                            args=(conversation_id,),
+                        )
 
-    if st.session_state.pending_retry == conversation_id:
-        st.session_state.pending_retry = None
-        st.session_state.streaming = True
-        try:
-            with st.chat_message("assistant"):
-                st.write_stream(stream_turn(f"/api/conversations/{conversation_id}/retry"))
-        except TurnFailed as exc:
-            st.error(str(exc))
-        finally:
-            st.session_state.streaming = False
-        st.rerun()
+        if st.session_state.pending_retry == conversation_id:
+            st.session_state.pending_retry = None
+            st.session_state.streaming = True
+            try:
+                with st.chat_message("assistant"):
+                    st.write_stream(stream_turn(f"/api/conversations/{conversation_id}/retry"))
+            except TurnFailed as exc:
+                st.error(str(exc))
+            finally:
+                st.session_state.streaming = False
+            st.rerun()
 
     _watch_for_peer_activity(conversation_id)
 

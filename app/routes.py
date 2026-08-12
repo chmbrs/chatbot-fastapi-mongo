@@ -1,19 +1,27 @@
 import json
 from contextlib import suppress
-from typing import Annotated
+from typing import Annotated, Literal
 
-from fastapi import APIRouter, Depends, Path, Request
+from fastapi import APIRouter, BackgroundTasks, Depends, Path, Request
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from sse_starlette import EventSourceResponse
 
 from app.chat import DEFAULT_TITLE, ChatService, TurnDelta, TurnDone, TurnStarted
-from app.config import Settings, get_settings
-from app.errors import AppError, ConversationNotFound, error_envelope
+from app.config import Settings
+from app.errors import (
+    AppError,
+    ConversationNotFound,
+    HeldMessageNotFound,
+    ProviderSwitchNotAllowed,
+    error_envelope,
+)
+from app.llm import build_llm
 from app.llm.base import LLMClient
 from app.llm.openai_compatible import OpenAICompatibleLLMClient
-from app.models import Conversation, Message
+from app.models import Conversation, Delivery, HeldMessage, InboundPolicy, Message
+from app.peers import deliver, run_exchange
 from app.repository import Repository
 
 router = APIRouter()
@@ -21,6 +29,7 @@ router = APIRouter()
 # 24 hex chars — a MongoDB ObjectId. Malformed ids are 422 at the edge,
 # never a 500 from inside bson.
 ConversationId = Annotated[str, Path(pattern=r"^[0-9a-fA-F]{24}$")]
+HeldMessageId = Annotated[str, Path(pattern=r"^[0-9a-fA-F]{24}$")]
 
 
 def get_repository(request: Request) -> Repository:
@@ -35,9 +44,17 @@ def get_llm(request: Request) -> LLMClient:
     return request.app.state.llm
 
 
+def get_app_settings(request: Request) -> Settings:
+    # The exact Settings this app was built with (app/main.py stores it on
+    # app.state), not get_settings()'s process-wide singleton: a test app
+    # built with its own throwaway Settings must never read or mutate some
+    # other app's config, and set_llm_provider below does mutate this.
+    return request.app.state.settings
+
+
 RepositoryDep = Annotated[Repository, Depends(get_repository)]
 ChatServiceDep = Annotated[ChatService, Depends(get_chat_service)]
-SettingsDep = Annotated[Settings, Depends(get_settings)]
+SettingsDep = Annotated[Settings, Depends(get_app_settings)]
 LLMDep = Annotated[LLMClient, Depends(get_llm)]
 
 
@@ -51,6 +68,23 @@ class RenameConversationBody(BaseModel):
 
 class SendMessageBody(BaseModel):
     content: str = Field(min_length=1, max_length=8000)
+
+
+class SendPeerMessageBody(BaseModel):
+    to_handle: str = Field(min_length=1, max_length=64)
+    text: str = Field(min_length=1, max_length=8000)
+
+
+class SetInboundPolicyBody(BaseModel):
+    policy: InboundPolicy
+
+
+class SetLlmProviderBody(BaseModel):
+    # Deliberately narrower than Settings.llm_provider's four values: this
+    # endpoint is the no-key toggle only. Picking "openrouter" from here
+    # would need a key it doesn't have, and there is nothing to toggle once
+    # a key is configured — see the has_api_key gate in health() below.
+    provider: Literal["demo", "ollama"]
 
 
 @router.get("/api/health")
@@ -90,8 +124,31 @@ async def health(repository: RepositoryDep, llm: LLMDep, settings: SettingsDep):
             "model": llm.model,
             "configured": settings.llm_configured,
             "degraded_reason": degraded_reason,
+            # Distinct from "configured": that's true for ollama even with no
+            # key. This is what the UI's demo/Ollama toggle gates on, since a
+            # real key already answers "which provider" and isn't something
+            # this app switches out from under whoever configured it.
+            "has_api_key": settings.llm_api_key is not None,
         },
     }
+
+
+@router.put("/api/settings/llm-provider")
+async def set_llm_provider(body: SetLlmProviderBody, request: Request, settings: SettingsDep):
+    """The runtime half of the demo/Ollama toggle in the UI. No key means
+    nothing here is really "configured" yet, so switching between the two
+    keyless providers is safe to do live, no restart. Once LLM_API_KEY is
+    set, this always 400s: a real key already answers "which provider", and
+    silently overriding it would contradict the one-directional resolution
+    documented in README (a present key always wins)."""
+    if settings.llm_api_key is not None:
+        raise ProviderSwitchNotAllowed()
+
+    settings.llm_provider = body.provider
+    llm = build_llm(settings)
+    request.app.state.llm = llm
+    request.app.state.chat_service = ChatService(request.app.state.repository, llm)
+    return {"provider": llm.name, "model": llm.model}
 
 
 @router.post("/api/conversations", status_code=201, response_model=Conversation)
@@ -138,6 +195,122 @@ async def list_messages(conversation_id: ConversationId, repository: RepositoryD
     if conversation is None:
         raise ConversationNotFound(conversation_id)
     return await repository.list_messages(conversation_id)
+
+
+# --- peer messaging (see app/peers.py) --------------------------------------
+
+
+@router.get("/api/agents", response_model=list[Conversation])
+async def list_agents(repository: RepositoryDep):
+    """The roster, mirroring Claude Code's `/list-agents`: every conversation
+    this app can reach, by the handle it answers to."""
+    return await repository.list_conversations()
+
+
+@router.put("/api/conversations/{conversation_id}/inbound", response_model=Conversation)
+async def set_inbound_policy(
+    conversation_id: ConversationId, body: SetInboundPolicyBody, repository: RepositoryDep
+):
+    updated = await repository.set_inbound_policy(conversation_id, body.policy)
+    if not updated:
+        raise ConversationNotFound(conversation_id)
+    return await repository.get_conversation(conversation_id)
+
+
+@router.post(
+    "/api/conversations/{conversation_id}/send", status_code=202, response_model=Delivery
+)
+async def send_peer_message(
+    conversation_id: ConversationId,
+    body: SendPeerMessageBody,
+    background: BackgroundTasks,
+    repository: RepositoryDep,
+    chat_service: ChatServiceDep,
+    settings: SettingsDep,
+):
+    """No SSE here: the interesting output of this call lands in *another*
+    conversation, not this response, so there's nothing for this caller to
+    stream. `delivered` starts the receiving turn as a background task —
+    the response returns immediately with the outcome, before that turn (or
+    the exchange it may lead to) has produced a single token. See
+    app/peers.py's run_exchange for why that turn is already durable with no
+    extra machinery: the assistant row it writes is committed as
+    `interrupted` before its first token, exactly like every other turn."""
+    from_conversation = await repository.get_conversation(conversation_id)
+    if from_conversation is None:
+        raise ConversationNotFound(conversation_id)
+
+    delivery = await deliver(
+        repository,
+        to_handle=body.to_handle,
+        text=body.text,
+        from_conversation_id=conversation_id,
+        from_handle=from_conversation.handle,
+        hops=0,
+    )
+    if delivery.outcome == "delivered":
+        background.add_task(
+            run_exchange,
+            repository,
+            chat_service,
+            to_conversation_id=delivery.to_conversation_id,
+            text=body.text,
+            from_conversation_id=conversation_id,
+            from_handle=from_conversation.handle,
+            hops=0,
+            hop_limit=settings.peer_hop_limit,
+        )
+    return delivery
+
+
+@router.get("/api/conversations/{conversation_id}/inbox", response_model=list[HeldMessage])
+async def list_inbox(conversation_id: ConversationId, repository: RepositoryDep):
+    conversation = await repository.get_conversation(conversation_id)
+    if conversation is None:
+        raise ConversationNotFound(conversation_id)
+    return await repository.list_held_messages(conversation_id)
+
+
+@router.post(
+    "/api/conversations/{conversation_id}/inbox/{held_id}/approve",
+    status_code=202,
+    response_model=Delivery,
+)
+async def approve_held_message(
+    conversation_id: ConversationId,
+    held_id: HeldMessageId,
+    background: BackgroundTasks,
+    repository: RepositoryDep,
+    chat_service: ChatServiceDep,
+    settings: SettingsDep,
+):
+    conversation = await repository.get_conversation(conversation_id)
+    held = await repository.get_held_message(conversation_id, held_id)
+    if conversation is None or held is None:
+        raise HeldMessageNotFound(held_id)
+    await repository.delete_held_message(conversation_id, held_id)
+
+    background.add_task(
+        run_exchange,
+        repository,
+        chat_service,
+        to_conversation_id=conversation_id,
+        text=held.text,
+        from_conversation_id=held.from_conversation_id,
+        from_handle=held.from_handle,
+        hops=held.hops,
+        hop_limit=settings.peer_hop_limit,
+    )
+    return Delivery(outcome="delivered", to_handle=conversation.handle, to_conversation_id=conversation_id)
+
+
+@router.delete("/api/conversations/{conversation_id}/inbox/{held_id}", status_code=204)
+async def deny_held_message(
+    conversation_id: ConversationId, held_id: HeldMessageId, repository: RepositoryDep
+):
+    deleted = await repository.delete_held_message(conversation_id, held_id)
+    if not deleted:
+        raise HeldMessageNotFound(held_id)
 
 
 @router.post("/api/conversations/{conversation_id}/messages")

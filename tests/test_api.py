@@ -247,6 +247,142 @@ def test_every_error_response_carries_a_request_id(client):
     assert response.headers["x-request-id"] == response.json()["error"]["request_id"]
 
 
+def test_the_roster_lists_every_conversation_by_handle(client):
+    created = client.post("/api/conversations", json={"title": "payments API"})
+    conversation_id = created.json()["id"]
+
+    roster = client.get("/api/agents")
+    assert roster.status_code == 200
+    entry = next(c for c in roster.json() if c["id"] == conversation_id)
+    assert entry["handle"] == created.json()["handle"]
+    assert entry["handle"].endswith(conversation_id[-4:])
+
+
+def test_an_inbound_policy_round_trips(client):
+    created = client.post("/api/conversations", json={})
+    conversation_id = created.json()["id"]
+    assert created.json()["inbound"] == "accept"
+
+    updated = client.put(
+        f"/api/conversations/{conversation_id}/inbound", json={"policy": "hold"}
+    )
+    assert updated.status_code == 200
+    assert updated.json()["inbound"] == "hold"
+
+    fetched = client.get(f"/api/conversations/{conversation_id}")
+    assert fetched.json()["inbound"] == "hold"
+
+
+def test_send_delivers_and_the_reply_lands_in_the_other_conversation(client):
+    """No sleeps: TestClient drives the background task to completion inside
+    client.post() itself (see app/routes.py's send_peer_message docstring),
+    so the receiving turn has already run by the time this call returns."""
+    sender = client.post("/api/conversations", json={"title": "sender"}).json()
+    receiver = client.post("/api/conversations", json={"title": "receiver"}).json()
+
+    response = client.post(
+        f"/api/conversations/{sender['id']}/send",
+        json={"to_handle": receiver["handle"], "text": "ping"},
+    )
+    assert response.status_code == 202
+    assert response.json()["outcome"] == "delivered"
+
+    # Not an exact-length assertion: with the default PEER_HOP_LIMIT, a demo
+    # reply is real content, so the exchange forwards back to the sender too
+    # (see app/peers.py's run_exchange) — checking the first two rows pins
+    # what this test is actually about without coupling it to the hop count.
+    receiver_messages = client.get(f"/api/conversations/{receiver['id']}/messages").json()
+    assert receiver_messages[0]["role"] == "peer"
+    assert receiver_messages[0]["peer"]["from_handle"] == sender["handle"]
+    assert receiver_messages[1]["role"] == "assistant"
+    assert receiver_messages[1]["status"] == "complete"
+
+
+def test_send_to_an_unknown_handle_is_404(client):
+    sender = client.post("/api/conversations", json={}).json()
+
+    response = client.post(
+        f"/api/conversations/{sender['id']}/send",
+        json={"to_handle": "nobody-home", "text": "hello?"},
+    )
+    assert response.status_code == 404
+    assert response.json()["error"]["code"] == "peer_not_found"
+
+
+def test_a_refused_send_returns_202_with_no_new_message(client):
+    sender = client.post("/api/conversations", json={}).json()
+    receiver = client.post("/api/conversations", json={}).json()
+    client.put(f"/api/conversations/{receiver['id']}/inbound", json={"policy": "refuse"})
+
+    response = client.post(
+        f"/api/conversations/{sender['id']}/send",
+        json={"to_handle": receiver["handle"], "text": "ping"},
+    )
+    assert response.status_code == 202
+    assert response.json()["outcome"] == "refused"
+    assert client.get(f"/api/conversations/{receiver['id']}/messages").json() == []
+
+
+def test_a_held_send_appears_in_the_inbox_and_approving_it_delivers(client):
+    sender = client.post("/api/conversations", json={}).json()
+    receiver = client.post("/api/conversations", json={}).json()
+    client.put(f"/api/conversations/{receiver['id']}/inbound", json={"policy": "hold"})
+
+    sent = client.post(
+        f"/api/conversations/{sender['id']}/send",
+        json={"to_handle": receiver["handle"], "text": "ping"},
+    )
+    assert sent.json()["outcome"] == "held"
+
+    inbox = client.get(f"/api/conversations/{receiver['id']}/inbox").json()
+    assert len(inbox) == 1
+    assert inbox[0]["text"] == "ping"
+    held_id = inbox[0]["id"]
+
+    approved = client.post(f"/api/conversations/{receiver['id']}/inbox/{held_id}/approve")
+    assert approved.status_code == 202
+
+    # The approved held row is gone. A conversation left on `hold` still
+    # holds anything that bounces back to it later in the *same* exchange
+    # (see app/peers.py's run_exchange), so the inbox isn't necessarily
+    # empty afterward — only this specific row is.
+    remaining_ids = {
+        h["id"] for h in client.get(f"/api/conversations/{receiver['id']}/inbox").json()
+    }
+    assert held_id not in remaining_ids
+
+    receiver_messages = client.get(f"/api/conversations/{receiver['id']}/messages").json()
+    assert [m["role"] for m in receiver_messages] == ["peer", "assistant"]
+
+
+def test_denying_a_held_message_removes_it_without_running_a_turn(client):
+    sender = client.post("/api/conversations", json={}).json()
+    receiver = client.post("/api/conversations", json={}).json()
+    client.put(f"/api/conversations/{receiver['id']}/inbound", json={"policy": "hold"})
+    client.post(
+        f"/api/conversations/{sender['id']}/send",
+        json={"to_handle": receiver["handle"], "text": "ping"},
+    )
+    held_id = client.get(f"/api/conversations/{receiver['id']}/inbox").json()[0]["id"]
+
+    denied = client.delete(f"/api/conversations/{receiver['id']}/inbox/{held_id}")
+    assert denied.status_code == 204
+
+    assert client.get(f"/api/conversations/{receiver['id']}/inbox").json() == []
+    assert client.get(f"/api/conversations/{receiver['id']}/messages").json() == []
+
+
+def test_a_conversation_cannot_send_to_itself(client):
+    conversation = client.post("/api/conversations", json={}).json()
+
+    response = client.post(
+        f"/api/conversations/{conversation['id']}/send",
+        json={"to_handle": conversation["handle"], "text": "echo"},
+    )
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "cannot_message_self"
+
+
 def test_request_id_is_present_even_for_errors_raised_inside_the_chat_generator(client):
     """A regression test: NothingToRetry is raised from inside
     ChatService.retry_turn — a different code path than ConversationNotFound
@@ -261,3 +397,36 @@ def test_request_id_is_present_even_for_errors_raised_inside_the_chat_generator(
     assert response.status_code == 400
     assert response.json()["error"]["request_id"]
     assert response.headers["x-request-id"] == response.json()["error"]["request_id"]
+
+
+def test_llm_provider_can_be_switched_to_ollama_and_back_with_no_key_set(client):
+    """The no-restart half of the demo/Ollama toggle: no key means neither
+    provider needs one, so this switches app.state.llm live. Ollama's own
+    reachability isn't asserted here — a dead endpoint fails the next turn,
+    named, same as it does for a provider picked at startup.
+    """
+    assert client.get("/api/health").json()["llm"]["provider"] == "demo"
+
+    switched = client.put("/api/settings/llm-provider", json={"provider": "ollama"})
+    assert switched.status_code == 200
+    assert switched.json()["provider"] == "ollama"
+    assert client.get("/api/health").json()["llm"]["provider"] == "ollama"
+
+    back = client.put("/api/settings/llm-provider", json={"provider": "demo"})
+    assert back.status_code == 200
+    assert client.get("/api/health").json()["llm"]["provider"] == "demo"
+
+
+def test_llm_provider_cannot_be_switched_once_a_key_is_configured(app_settings):
+    """A real key already answers "which provider" (README: a present key
+    always wins). Switching it out from under whoever set it would be a
+    silent override of that decision, so this 400s instead.
+    """
+    app_settings.llm_api_key = "sk-test"
+    with TestClient(create_app(app_settings)) as client:
+        assert client.get("/api/health").json()["llm"]["has_api_key"] is True
+
+        response = client.put("/api/settings/llm-provider", json={"provider": "demo"})
+
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "provider_switch_not_allowed"

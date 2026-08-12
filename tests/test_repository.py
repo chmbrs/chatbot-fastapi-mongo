@@ -153,6 +153,38 @@ async def test_messages_in_the_same_millisecond_are_ordered_by_id(repository):
     assert [m.id for m in listed] == [str(i) for i in ids]
 
 
+async def test_a_conversation_document_written_before_this_feature_still_loads(repository):
+    """The handle and inbound fields are additive with model defaults, not a
+    migration: a document written before app/peers.py existed has neither
+    field on disk, and it must still round-trip through Conversation."""
+    now = datetime.now(UTC)
+    doc = {
+        "_id": ObjectId(),
+        "title": "pre-existing chat",
+        "created_at": now,
+        "updated_at": now,
+        "model": "demo",
+    }
+    await repository.conversations.insert_one(doc)
+
+    loaded = await repository.get_conversation(str(doc["_id"]))
+
+    assert loaded.inbound == "accept"
+    assert loaded.handle.endswith(str(doc["_id"])[-4:])
+
+
+async def test_two_same_titled_conversations_get_distinct_handles(repository):
+    """The handle is derived from title *and* id, precisely so a title
+    collision — including two conversations both left at DEFAULT_TITLE —
+    can never produce a handle collision."""
+    first = await repository.create_conversation(title="New conversation", model="demo")
+    second = await repository.create_conversation(title="New conversation", model="demo")
+
+    assert first.handle != second.handle
+    assert first.handle.endswith(first.id[-4:])
+    assert second.handle.endswith(second.id[-4:])
+
+
 async def test_the_message_sort_is_served_by_the_index_without_an_in_memory_sort(repository):
     """The trailing _id in the compound index exists so the tiebroken sort stays
     a pure index scan. If someone later trims the index back, this fails rather

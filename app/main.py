@@ -57,6 +57,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         await repository.ensure_indexes()
 
         app.state.repository = repository
+        # The exact Settings instance this app was built with, not
+        # get_settings()'s process-wide singleton: routes.py's
+        # set_llm_provider mutates this at runtime, and a test app built
+        # with its own throwaway Settings must never reach past its own
+        # state to affect (or read) some other app's process-wide config.
+        app.state.settings = settings
         app.state.llm = build_llm(settings)
         app.state.chat_service = ChatService(app.state.repository, app.state.llm)
         _log_provider(app.state.llm, settings)

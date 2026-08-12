@@ -26,6 +26,17 @@ class LLMNotConfigured(AppError):
         )
 
 
+class ProviderSwitchNotAllowed(AppError):
+    code = "provider_switch_not_allowed"
+    http_status = 400
+
+    def __init__(self):
+        super().__init__(
+            "LLM_API_KEY is configured, so the provider is fixed to the real model. "
+            "Remove the key to switch between the demo and Ollama from the UI."
+        )
+
+
 class InvalidApiKey(AppError):
     code = "invalid_key"
     http_status = 502
@@ -104,6 +115,30 @@ class NothingToRetry(AppError):
         super().__init__(
             f"Conversation '{conversation_id}' has no failed or interrupted reply to retry."
         )
+
+
+class PeerNotFound(AppError):
+    code = "peer_not_found"
+    http_status = 404
+
+    def __init__(self, handle: str):
+        super().__init__(f"No conversation answers to the handle '{handle}'.")
+
+
+class CannotMessageSelf(AppError):
+    code = "cannot_message_self"
+    http_status = 400
+
+    def __init__(self):
+        super().__init__("A conversation cannot send a peer message to itself.")
+
+
+class HeldMessageNotFound(AppError):
+    code = "held_message_not_found"
+    http_status = 404
+
+    def __init__(self, held_id: str):
+        super().__init__(f"No held message found with id '{held_id}'.")
 
 
 def error_envelope(exc: AppError, request_id: str | None = None) -> dict:

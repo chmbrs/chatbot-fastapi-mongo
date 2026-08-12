@@ -30,11 +30,18 @@ class Settings(BaseSettings):
     # host.docker.internal, not localhost — this app runs in a container and
     # Ollama runs on the host (compose maps the name on Linux too).
     ollama_base_url: str = "http://host.docker.internal:11434/v1"
-    # A small, non-reasoning instruct model on purpose. Reasoning models
-    # (qwen3.5, deepseek-r1) put their thinking in a separate `reasoning` field
-    # and leave `content` empty until it finishes — over an OpenAI-compatible
+    # A non-reasoning instruct model on purpose. Reasoning models (qwen3.5,
+    # deepseek-r1) put their thinking in a separate `reasoning` field and
+    # leave `content` empty until it finishes — over an OpenAI-compatible
     # stream that is indistinguishable from a hang, for as long as it thinks.
-    ollama_model: str = "llama3.2"
+    ollama_model: str = "gemma4:latest"
+
+    # Hop cap for conversation-to-conversation messaging (see app/peers.py).
+    # Each forwarded reply increments a shared counter across the whole
+    # exchange, not a per-pair one, so even a three-way cycle terminates on
+    # it. 1 delivers and replies but never forwards — the off switch, with no
+    # second setting needed.
+    peer_hop_limit: int = 3
 
     @property
     def llm_configured(self) -> bool:

@@ -1,4 +1,4 @@
-"""The turn lifecycle — the core of this submission.
+"""The turn lifecycle, the core of this submission.
 
 Imports neither `fastapi` nor `openai` directly: only the LLMClient Protocol
 and the Repository. That's what makes this module testable with a fake LLM
@@ -9,22 +9,22 @@ Two writes bracket every turn, and the order of them is the whole design:
 1. The user's message is committed before any provider call. A failed
    completion must never eat the user's turn.
 2. The assistant's row is committed *before the first token*, already reading
-   `interrupted` with empty content — "if nothing further happens, this is
-   what happened". Streaming then updates it to `complete`, or to `failed`
+   `interrupted` with empty content: "if nothing further happens, this is
+   what happened." Streaming then updates it to `complete`, or to `failed`
    with the error, or enriches the `interrupted` row with whatever text
    arrived.
 
 The point of (2) is that the honest terminal state is persisted by
 construction rather than by cleanup. An earlier version wrote the assistant
-row once, at the end, from the generator's `finally` — elegant on paper, and
-it lost the message outright on roughly two thirds of real mid-stream
-disconnects, because durability then depends on async-generator finalization,
-which under a real disconnect races itself (`RuntimeError: aclose():
-asynchronous generator is already running`). Now no cleanup path has to run
-for the persisted state to be true; the `except` handlers below only improve
-the record, they are not what makes it correct.
+row once, at the end, from the generator's `finally`. It was elegant on
+paper, and it lost the message outright on roughly two thirds of real
+mid-stream disconnects, because durability then depended on async-generator
+finalization, which under a real disconnect races itself
+(`RuntimeError: aclose(): asynchronous generator is already running`). Now
+no cleanup path has to run for the persisted state to be true; the `except`
+handlers below only improve the record, they are not what makes it correct.
 
-A client disconnect and the Stop button are the same event here — the server
+A client disconnect and the Stop button are the same event here: the server
 genuinely cannot tell them apart, and both land on `interrupted`.
 """
 
@@ -42,6 +42,10 @@ from app.repository import Repository
 HISTORY_LIMIT = 20
 DEFAULT_TITLE = "New conversation"
 _TITLE_MAX_LENGTH = 60
+_TITLE_PROMPT = (
+    "Reply with only a short title (3 to 6 words, no punctuation, no quotes) "
+    "summarizing what this message is about:\n\n"
+)
 
 
 @dataclass(frozen=True)
@@ -76,15 +80,15 @@ class ChatService:
         request has exactly one of them.
 
         That is a correctness constraint, not a style preference. Closing an
-        async generator does not close a generator it happens to be iterating —
-        `async for` abandons its iterator when the loop exits by exception — so
+        async generator does not close a generator it happens to be iterating:
+        `async for` abandons its iterator when the loop exits by exception, so
         a wrapper here left _generate's finally, and with it the persist-what-
         happened guarantee, to the garbage collector. Nesting them and closing
         both in turn only traded that for `aclose(): asynchronous generator is
         already running` under a real disconnect. One generator has neither
         problem.
         """
-        # insert_message only validates id *format* — a well-formed but
+        # insert_message only validates id *format*. A well-formed but
         # nonexistent id would otherwise insert an orphaned message, so
         # existence is checked explicitly, once, up front.
         conversation = await self._repository.get_conversation(conversation_id)
@@ -97,7 +101,8 @@ class ChatService:
 
         history = await self._repository.list_messages(conversation_id)
         if len(history) == 1 and conversation.title == DEFAULT_TITLE:
-            await self._repository.rename_conversation(conversation_id, _derive_title(content))
+            title = await self._generate_title(content)
+            await self._repository.rename_conversation(conversation_id, title)
 
         return self._generate(conversation_id, history, user_message.id)
 
@@ -121,12 +126,51 @@ class ChatService:
 
         return self._generate(conversation_id, history, history[-1].id)
 
+    async def run_peer_turn(
+        self,
+        conversation_id: str,
+        text: str,
+        *,
+        from_handle: str,
+        from_conversation_id: str,
+        hops: int,
+    ) -> AsyncIterator[StreamEvent]:
+        """The peer twin of run_turn (see app/peers.py): what arrives before
+        any provider call is a `peer`-role row instead of a `user`-role one,
+        naming the sender it came from. Everything past that point is the
+        same lifecycle, the same generator, and the same guarantee, including
+        the `return`-not-`yield` correctness constraint documented on
+        run_turn above.
+        """
+        conversation = await self._repository.get_conversation(conversation_id)
+        if conversation is None:
+            raise ConversationNotFound(conversation_id)
+
+        peer_message = await self._repository.insert_message(
+            conversation_id,
+            role="peer",
+            content=text,
+            status="complete",
+            peer={
+                "from_handle": from_handle,
+                "from_conversation_id": from_conversation_id,
+                "hops": hops,
+            },
+        )
+
+        history = await self._repository.list_messages(conversation_id)
+        if len(history) == 1 and conversation.title == DEFAULT_TITLE:
+            title = await self._generate_title(text)
+            await self._repository.rename_conversation(conversation_id, title)
+
+        return self._generate(conversation_id, history, peer_message.id)
+
     async def _generate(
         self, conversation_id: str, history: list[Message], user_message_id: str
     ) -> AsyncIterator[StreamEvent]:
-        llm_messages = [
-            {"role": m.role, "content": m.content} for m in history if m.status == "complete"
-        ][-HISTORY_LIMIT:]
+        llm_messages = [_to_llm_message(m) for m in history if m.status == "complete"][
+            -HISTORY_LIMIT:
+        ]
 
         # Committed before the first token, and already reading `interrupted`:
         # the state that is true if this process is killed on the next line.
@@ -180,7 +224,7 @@ class ChatService:
         except (asyncio.CancelledError, GeneratorExit):
             # Stop, or a closed tab. Two spellings of one event: a cancelled
             # task raises CancelledError at the yield, a closed generator gets
-            # GeneratorExit. Best effort by design — the row already says
+            # GeneratorExit. Best effort by design: the row already says
             # `interrupted`, so this only adds the text that made it through,
             # and if the disconnect tears us down first we lose the partial
             # text, never the truth about what happened.
@@ -224,6 +268,59 @@ class ChatService:
         )
         await self._repository.touch_conversation(conversation_id)
         return message
+
+    async def _generate_title(self, content: str) -> str:
+        """The title is now the model's own summary of the opener, not a
+        truncation of it: "In one short sentence, why use two collections
+        instead of embedded messages?" makes a poor sidebar label, and a
+        real summary doesn't. Demo mode is excluded on purpose: its one
+        fixed reply text has nothing to do with what the user asked, so it
+        is never a title source. Any other failure here (a rate limit, a
+        cold Ollama load that times out, an SDK bug) falls back to the
+        original heuristic, the same as demo mode does, on the same
+        reasoning as the `suppress(Exception)` in `_generate` above: a bad
+        title is never worth failing the turn over. `_derive_title` doubles
+        as the format guardrail on whatever the model actually returns, in
+        case it ignores the instruction.
+        """
+        if self._llm.name != "demo":
+            try:
+                chunks = [
+                    chunk.text
+                    async for chunk in self._llm.stream(
+                        [{"role": "user", "content": _TITLE_PROMPT + content}]
+                    )
+                ]
+            except Exception:
+                pass
+            else:
+                generated = " ".join("".join(chunks).split()).strip("\"'“”‘’")
+                if generated:
+                    return _derive_title(generated)
+        return _derive_title(content)
+
+
+async def drain(turn: AsyncIterator[StreamEvent]) -> Message | None:
+    """The non-HTTP twin of routes.py's _render_json: fully consumes a turn's
+    generator and returns whatever it finally persisted. app/peers.py uses
+    this to run a turn with no HTTP client attached, since the receiving
+    half of a peer exchange has nothing to stream to."""
+    final: Message | None = None
+    async for event in turn:
+        if isinstance(event, TurnDone):
+            final = event.message
+    return final
+
+
+def _to_llm_message(message: Message) -> dict[str, str]:
+    """`peer` is not an OpenAI role, so a peer row is rendered as the user
+    turn it functionally is, prefixed with who it came from, the same way
+    Claude Code tells a receiving session a message came from another
+    session rather than from the person at the keyboard."""
+    if message.role == "peer":
+        handle = message.peer.from_handle if message.peer else "unknown"
+        return {"role": "user", "content": f"[message from @{handle}]\n{message.content}"}
+    return {"role": message.role, "content": message.content}
 
 
 def _derive_title(content: str) -> str:
