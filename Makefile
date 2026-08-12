@@ -10,7 +10,9 @@ logs:
 	docker compose logs -f api
 
 test:
-	docker compose --profile test run --rm tests
+	# --build is not optional: the test image bakes in tests/ and app/, so
+	# without it an edited file runs green against the previous build.
+	docker compose --profile test run --rm --build tests
 
 fmt:
 	uv run ruff format .

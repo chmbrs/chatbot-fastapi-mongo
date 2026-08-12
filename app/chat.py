@@ -1,24 +1,38 @@
-"""The turn lifecycle, as one async generator — the core of this submission.
+"""The turn lifecycle — the core of this submission.
 
 Imports neither `fastapi` nor `openai` directly: only the LLMClient Protocol
 and the Repository. That's what makes this module testable with a fake LLM
 and no real database.
 
-The user's message is committed before any provider call — a failed
-completion must never eat the user's turn. Whatever the generator's exit
-path is — normal completion, an AppError, or cancellation (a client
-disconnect and the Stop button look identical here: the server genuinely
-can't tell them apart, verified against sse-starlette's actual behavior,
-not assumed) — the assistant message is written exactly once, in a
-`finally`, shielded so a second cancellation can't cut the write short.
+Two writes bracket every turn, and the order of them is the whole design:
+
+1. The user's message is committed before any provider call. A failed
+   completion must never eat the user's turn.
+2. The assistant's row is committed *before the first token*, already reading
+   `interrupted` with empty content — "if nothing further happens, this is
+   what happened". Streaming then updates it to `complete`, or to `failed`
+   with the error, or enriches the `interrupted` row with whatever text
+   arrived.
+
+The point of (2) is that the honest terminal state is persisted by
+construction rather than by cleanup. An earlier version wrote the assistant
+row once, at the end, from the generator's `finally` — elegant on paper, and
+it lost the message outright on roughly two thirds of real mid-stream
+disconnects, because durability then depends on async-generator finalization,
+which under a real disconnect races itself (`RuntimeError: aclose():
+asynchronous generator is already running`). Now no cleanup path has to run
+for the persisted state to be true; the `except` handlers below only improve
+the record, they are not what makes it correct.
+
+A client disconnect and the Stop button are the same event here — the server
+genuinely cannot tell them apart, and both land on `interrupted`.
 """
 
 import asyncio
 import time
 from collections.abc import AsyncIterator
+from contextlib import suppress
 from dataclasses import dataclass
-
-from bson import ObjectId
 
 from app.errors import AppError, ConversationNotFound, NothingToRetry
 from app.llm.base import LLMClient
@@ -56,6 +70,20 @@ class ChatService:
         self._llm = llm
 
     async def run_turn(self, conversation_id: str, content: str) -> AsyncIterator[StreamEvent]:
+        """A coroutine that *returns* the stream, deliberately not an async
+        generator that wraps one. Setup is awaited here and errors surface at
+        the call site; only _generate below is a generator, so the whole
+        request has exactly one of them.
+
+        That is a correctness constraint, not a style preference. Closing an
+        async generator does not close a generator it happens to be iterating —
+        `async for` abandons its iterator when the loop exits by exception — so
+        a wrapper here left _generate's finally, and with it the persist-what-
+        happened guarantee, to the garbage collector. Nesting them and closing
+        both in turn only traded that for `aclose(): asynchronous generator is
+        already running` under a real disconnect. One generator has neither
+        problem.
+        """
         # insert_message only validates id *format* — a well-formed but
         # nonexistent id would otherwise insert an orphaned message, so
         # existence is checked explicitly, once, up front.
@@ -71,8 +99,7 @@ class ChatService:
         if len(history) == 1 and conversation.title == DEFAULT_TITLE:
             await self._repository.rename_conversation(conversation_id, _derive_title(content))
 
-        async for event in self._generate(conversation_id, history, user_message.id):
-            yield event
+        return self._generate(conversation_id, history, user_message.id)
 
     async def retry_turn(self, conversation_id: str) -> AsyncIterator[StreamEvent]:
         conversation = await self._repository.get_conversation(conversation_id)
@@ -80,16 +107,19 @@ class ChatService:
             raise ConversationNotFound(conversation_id)
 
         history = await self._repository.list_messages(conversation_id)
-        if not history or history[-1].role != "assistant" or history[-1].status == "complete":
+        last = history[-1] if history else None
+        if last is None or (last.role == "assistant" and last.status == "complete"):
             raise NothingToRetry(conversation_id)
 
-        failed_reply = history[-1]
-        await self._repository.delete_message(conversation_id, failed_reply.id)
-        remaining_history = history[:-1]
-        user_message_id = remaining_history[-1].id
+        if last.role == "assistant":
+            # A failed or interrupted reply: drop it and regenerate in its place.
+            await self._repository.delete_message(conversation_id, last.id)
+            history = history[:-1]
 
-        async for event in self._generate(conversation_id, remaining_history, user_message_id):
-            yield event
+        if not history:
+            raise NothingToRetry(conversation_id)
+
+        return self._generate(conversation_id, history, history[-1].id)
 
     async def _generate(
         self, conversation_id: str, history: list[Message], user_message_id: str
@@ -98,20 +128,43 @@ class ChatService:
             {"role": m.role, "content": m.content} for m in history if m.status == "complete"
         ][-HISTORY_LIMIT:]
 
-        assistant_id = ObjectId()
+        # Committed before the first token, and already reading `interrupted`:
+        # the state that is true if this process is killed on the next line.
+        # Everything below only ever improves on it.
+        assistant = await self._repository.insert_message(
+            conversation_id,
+            role="assistant",
+            content="",
+            status="interrupted",
+            provider=self._llm.name,
+            model=self._llm.model,
+        )
         yield TurnStarted(
             conversation_id=conversation_id,
             user_message_id=user_message_id,
-            assistant_message_id=str(assistant_id),
+            assistant_message_id=assistant.id,
         )
 
         accumulated = ""
         usage: dict | None = None
         ttft_ms: int | None = None
-        status: MessageStatus = "complete"
-        error: AppError | None = None
         started_at = time.monotonic()
 
+        async def settle(status: MessageStatus, error: AppError | None = None) -> Message | None:
+            # Closes over the accumulator deliberately: it reads whatever has
+            # streamed by the moment it's called, which is the whole job.
+            return await self._settle(
+                conversation_id=conversation_id,
+                assistant_id=assistant.id,
+                status=status,
+                content=accumulated,
+                started_at=started_at,
+                ttft_ms=ttft_ms,
+                usage=usage,
+                error=error,
+            )
+
+        # Three exits, three terminal states, and nothing else below this line.
         try:
             async for chunk in self._llm.stream(llm_messages):
                 if chunk.text:
@@ -122,66 +175,52 @@ class ChatService:
                 if chunk.usage is not None:
                     usage = chunk.usage
         except AppError as exc:
-            status = "failed"
-            error = exc
-        except asyncio.CancelledError:
-            status = "interrupted"
+            await settle("failed", error=exc)
             raise
-        finally:
-            total_ms = int((time.monotonic() - started_at) * 1000)
-            # Shielded: this write must complete even if the task is
-            # cancelled a second time while we're cleaning up from the first.
-            assistant_message = await asyncio.shield(
-                self._finalize(
-                    conversation_id=conversation_id,
-                    assistant_id=assistant_id,
-                    content=accumulated,
-                    status=status,
-                    error=error,
-                    usage=usage,
-                    ttft_ms=ttft_ms,
-                    total_ms=total_ms,
-                )
-            )
+        except (asyncio.CancelledError, GeneratorExit):
+            # Stop, or a closed tab. Two spellings of one event: a cancelled
+            # task raises CancelledError at the yield, a closed generator gets
+            # GeneratorExit. Best effort by design — the row already says
+            # `interrupted`, so this only adds the text that made it through,
+            # and if the disconnect tears us down first we lose the partial
+            # text, never the truth about what happened.
+            with suppress(Exception):
+                await settle("interrupted")
+            raise
 
-        if error is not None:
-            raise error
+        yield TurnDone(message=await settle("complete"))
 
-        yield TurnDone(message=assistant_message)
-
-    async def _finalize(
+    async def _settle(
         self,
         *,
         conversation_id: str,
-        assistant_id: ObjectId,
-        content: str,
+        assistant_id: str,
         status: MessageStatus,
-        error: AppError | None,
-        usage: dict | None,
+        content: str,
+        started_at: float,
         ttft_ms: int | None,
-        total_ms: int | None,
-    ) -> Message:
-        error_payload = (
-            {
-                "code": error.code,
-                "message": error.message,
-                "retry_after_seconds": error.retry_after_seconds,
-            }
-            if error is not None
-            else None
-        )
-        message = await self._repository.insert_message(
+        usage: dict | None,
+        error: AppError | None = None,
+    ) -> Message | None:
+        """The turn's second and final write: the placeholder row grows into
+        what actually happened."""
+        message = await self._repository.update_message(
             conversation_id,
-            role="assistant",
+            assistant_id,
             content=content,
             status=status,
-            message_id=assistant_id,
-            error=error_payload,
-            provider=self._llm.name,
-            model=self._llm.model,
+            error=(
+                {
+                    "code": error.code,
+                    "message": error.message,
+                    "retry_after_seconds": error.retry_after_seconds,
+                }
+                if error is not None
+                else None
+            ),
             usage=usage,
             ttft_ms=ttft_ms,
-            total_ms=total_ms,
+            total_ms=int((time.monotonic() - started_at) * 1000),
         )
         await self._repository.touch_conversation(conversation_id)
         return message

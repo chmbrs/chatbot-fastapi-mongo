@@ -11,10 +11,20 @@ from datetime import UTC, datetime
 
 from bson import ObjectId
 from bson.errors import InvalidId
-from pymongo import AsyncMongoClient
+from pymongo import AsyncMongoClient, ReturnDocument
 from pymongo.errors import PyMongoError
 
 from app.models import Conversation, Message, MessageStatus
+
+# The _id tiebreak is not decoration. BSON datetimes are millisecond-precision,
+# and a user message plus its reply routinely land in the *same* millisecond
+# (measured: 32 of 40 turns against the demo provider) — at which point a sort
+# on the timestamp alone is formally unordered, and the transcript can come
+# back with the answer before the question. ObjectIds embed a timestamp and a
+# per-process counter, so within the single process that writes any one turn
+# they increase monotonically in exactly the order the rows were created.
+_OLDEST_FIRST = [("created_at", 1), ("_id", 1)]
+_NEWEST_FIRST = [("updated_at", -1), ("_id", -1)]
 
 
 def create_client(mongo_uri: str) -> AsyncMongoClient:
@@ -35,10 +45,15 @@ class Repository:
         last_error: PyMongoError | None = None
         for _ in range(retries):
             try:
-                await self.conversations.create_index([("updated_at", -1)])
-                # This prefix also serves conversation_id-only queries (e.g. the
-                # cascade delete), so no separate {conversation_id: 1} index.
-                await self.messages.create_index([("conversation_id", 1), ("created_at", 1)])
+                await self.conversations.create_index([("updated_at", -1), ("_id", -1)])
+                # {conversation_id: 1} and {conversation_id: 1, created_at: 1} are
+                # both prefixes of this one, so the cascade delete and any
+                # timestamp-only query are served by it too — no second index.
+                # The trailing _id is what keeps the tiebroken sort below a pure
+                # index scan instead of an in-memory SORT stage.
+                await self.messages.create_index(
+                    [("conversation_id", 1), ("created_at", 1), ("_id", 1)]
+                )
                 return
             except PyMongoError as exc:
                 last_error = exc
@@ -58,7 +73,7 @@ class Repository:
         return Conversation.from_doc(doc)
 
     async def list_conversations(self, limit: int = 50) -> list[Conversation]:
-        cursor = self.conversations.find().sort("updated_at", -1).limit(limit)
+        cursor = self.conversations.find().sort(_NEWEST_FIRST).limit(limit)
         return [Conversation.from_doc(doc) async for doc in cursor]
 
     async def get_conversation(self, conversation_id: str) -> Conversation | None:
@@ -99,7 +114,7 @@ class Repository:
         oid = _parse_id(conversation_id)
         if oid is None:
             return []
-        cursor = self.messages.find({"conversation_id": oid}).sort("created_at", 1)
+        cursor = self.messages.find({"conversation_id": oid}).sort(_OLDEST_FIRST)
         return [Message.from_doc(doc) async for doc in cursor]
 
     async def insert_message(
@@ -108,12 +123,8 @@ class Repository:
         role: str,
         content: str,
         status: MessageStatus,
-        message_id: ObjectId | None = None,
         **fields: object,
     ) -> Message | None:
-        """`message_id`, if given, is used as-is — this is what lets chat.py
-        mint the assistant message's id before a single token exists, so the
-        SSE `start` event can name it."""
         oid = _parse_id(conversation_id)
         if oid is None:
             return None
@@ -125,11 +136,26 @@ class Repository:
             "created_at": datetime.now(UTC),
             **fields,
         }
-        if message_id is not None:
-            doc["_id"] = message_id
         result = await self.messages.insert_one(doc)
         doc["_id"] = result.inserted_id
         return Message.from_doc(doc)
+
+    async def update_message(
+        self, conversation_id: str, message_id: str, **fields: object
+    ) -> Message | None:
+        """Returns the updated document, so chat.py never has to re-read what
+        it just wrote. Scoped by both ids for the same reason delete_message
+        is: an update must not cross a conversation boundary."""
+        conv_oid = _parse_id(conversation_id)
+        msg_oid = _parse_id(message_id)
+        if conv_oid is None or msg_oid is None:
+            return None
+        doc = await self.messages.find_one_and_update(
+            {"_id": msg_oid, "conversation_id": conv_oid},
+            {"$set": fields},
+            return_document=ReturnDocument.AFTER,
+        )
+        return Message.from_doc(doc) if doc else None
 
     async def delete_message(self, conversation_id: str, message_id: str) -> bool:
         conv_oid = _parse_id(conversation_id)

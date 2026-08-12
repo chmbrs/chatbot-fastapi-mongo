@@ -81,8 +81,18 @@ async def test_401_raises_invalid_api_key():
         await _collect(_client(handler), [{"role": "user", "content": "hi"}])
 
 
-async def test_429_raises_rate_limited_with_retry_after_seconds():
+async def test_429_raises_rate_limited_with_retry_after_seconds_and_does_not_retry():
+    """`max_retries=0` is a decision, not a default (see openrouter.py): on a
+    50-requests-per-day free tier, the SDK's blind backoff would spend a second
+    unit of the quota to produce the same error the user sees anyway. The call
+    count is the assertion that pins it — without it this test passes just as
+    happily if the SDK quietly retries twice more.
+    """
+    attempts = 0
+
     def handler(request):
+        nonlocal attempts
+        attempts += 1
         return httpx.Response(
             429, headers={"retry-after": "17"}, json={"error": {"message": "slow down"}}
         )
@@ -91,6 +101,7 @@ async def test_429_raises_rate_limited_with_retry_after_seconds():
         await _collect(_client(handler), [{"role": "user", "content": "hi"}])
 
     assert exc_info.value.retry_after_seconds == 17
+    assert attempts == 1
 
 
 async def test_402_no_credits_raises_upstream_error_naming_the_status():
@@ -109,3 +120,16 @@ async def test_connection_failure_raises_upstream_error():
 
     with pytest.raises(UpstreamError):
         await _collect(_client(handler), [{"role": "user", "content": "hi"}])
+
+
+async def test_the_suite_cannot_reach_the_network():
+    """Guards the guard. Every test above fakes only the transport, so the one
+    way this file could start silently spending a reviewer's free-tier quota is
+    an OpenRouterLLMClient built without a MockTransport. conftest.py's autouse
+    fixture makes that raise instead — this is the test that fails if that
+    fixture is ever removed or renamed, rather than the suite quietly going
+    live.
+    """
+    async with httpx.AsyncClient() as unguarded:
+        with pytest.raises(RuntimeError, match="real outbound HTTP request"):
+            await unguarded.get("https://openrouter.ai/api/v1/models")

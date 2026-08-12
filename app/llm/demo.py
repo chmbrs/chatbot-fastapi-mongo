@@ -1,9 +1,10 @@
-"""The offline provider: no network calls, fully deterministic. This is one
-of six places that make it obvious you're not talking to a real model — see
-config.py's llm_configured, the /api/health response, the X-LLM-Provider
-header, the frontend banner, and the "provider" field stored on every
-message. Deliberately boring: no keyword matching, no jokes. The moment
-this is clever, it's a gimmick and the repo reads as a toy.
+"""The offline provider: no network calls, fully deterministic. Demo mode
+announces itself in five places, because a reviewer who suspects the
+integration was faked has already failed the submission: this reply text,
+a startup warning in the container logs (main.py), the `provider` field
+stored on every message document, /api/health's degraded_reason, and the
+amber banner in the UI. Deliberately boring: no keyword matching, no jokes.
+The moment this is clever, it's a gimmick and the repo reads as a toy.
 """
 
 import asyncio

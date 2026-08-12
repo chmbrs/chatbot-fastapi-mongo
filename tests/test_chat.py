@@ -4,12 +4,14 @@ decisions — see the docstring on app/chat.py.
 """
 
 import asyncio
+import json
 
 import pytest
 
 from app.chat import DEFAULT_TITLE, ChatService, TurnDelta, TurnDone, TurnStarted
 from app.errors import AppError, ConversationNotFound, NothingToRetry
 from app.llm.base import LLMChunk
+from app.routes import _render_sse
 from tests.fakes import FakeLLMClient
 
 
@@ -19,7 +21,7 @@ async def test_user_message_persisted_even_when_the_llm_fails_immediately(reposi
     service = ChatService(repository, llm)
 
     with pytest.raises(AppError):
-        async for _ in service.run_turn(conv.id, "hello"):
+        async for _ in await service.run_turn(conv.id, "hello"):
             pass
 
     messages = await repository.list_messages(conv.id)
@@ -39,7 +41,7 @@ async def test_successful_turn_persists_complete_with_provider_model_and_timing(
     )
     service = ChatService(repository, llm)
 
-    events = [event async for event in service.run_turn(conv.id, "hi")]
+    events = [event async for event in await service.run_turn(conv.id, "hi")]
 
     assert isinstance(events[0], TurnStarted)
     assert all(isinstance(e, TurnDelta) for e in events[1:-1])
@@ -64,7 +66,7 @@ async def test_llm_error_persists_failed_with_partial_content_and_error_payload(
     service = ChatService(repository, llm)
 
     with pytest.raises(AppError):
-        async for _ in service.run_turn(conv.id, "hi"):
+        async for _ in await service.run_turn(conv.id, "hi"):
             pass
 
     messages = await repository.list_messages(conv.id)
@@ -91,7 +93,7 @@ async def test_cancellation_persists_interrupted_with_whatever_accumulated(repos
     events = []
 
     async def consume():
-        async for event in service.run_turn(conv.id, "hi"):
+        async for event in await service.run_turn(conv.id, "hi"):
             events.append(event)
 
     task = asyncio.create_task(consume())
@@ -107,20 +109,90 @@ async def test_cancellation_persists_interrupted_with_whatever_accumulated(repos
     assert assistant.content == "partial "
 
 
+async def test_closing_the_sse_renderer_midstream_persists_the_partial(repository):
+    """The disconnect path as it actually happens, which the cancellation test
+    above does *not* reach: a real disconnect doesn't cancel the turn, it tears
+    down the SSE renderer wrapped around it.
+
+    A regression test for a bug that shipped. When the assistant row was
+    written once, at the end, from the generator's `finally`, durability
+    depended on async-generator finalization — and against the running
+    container that lost the message outright on 10 of 16 mid-stream
+    disconnects. The row is now written up front, so what this pins is the
+    *enrichment*: the partial text that made it through is still recorded, on
+    top of a state that was already correct.
+    """
+    conv = await repository.create_conversation(title="t", model="fake")
+
+    class SlowLLM:
+        name = "fake"
+        model = "fake-model"
+
+        async def stream(self, messages):
+            yield LLMChunk(text="partial ")
+            await asyncio.sleep(10)  # never reached
+            yield LLMChunk(text="unreachable")
+
+    service = ChatService(repository, SlowLLM())
+    renderer = _render_sse(await service.run_turn(conv.id, "hi"), _StubRequest())
+
+    start = await anext(renderer)
+    assert start["event"] == "start"
+    delta = await anext(renderer)
+    assert json.loads(delta["data"])["text"] == "partial "
+
+    # Exactly what sse-starlette does when the client goes away.
+    await renderer.aclose()
+
+    # No sleep, no grace period: the write has to already be durable here.
+    messages = await repository.list_messages(conv.id)
+    assert [(m.role, m.status) for m in messages] == [
+        ("user", "complete"),
+        ("assistant", "interrupted"),
+    ]
+    assert messages[-1].content == "partial "
+
+
+class _StubRequest:
+    """_render_sse only touches request.state.request_id, and only on the
+    AppError branch — this keeps the test at the renderer level instead of
+    dragging in a full ASGI scope."""
+
+    class state:
+        request_id = "test-request-id"
+
+
 async def test_failed_turns_are_excluded_from_the_next_turns_history(repository):
     conv = await repository.create_conversation(title="t", model="fake")
 
     failing_llm = FakeLLMClient(error=AppError("boom"))
     with pytest.raises(AppError):
-        async for _ in ChatService(repository, failing_llm).run_turn(conv.id, "first"):
+        async for _ in await ChatService(repository, failing_llm).run_turn(conv.id, "first"):
             pass
 
     succeeding_llm = FakeLLMClient(chunks=[LLMChunk(text="ok")])
-    async for _ in ChatService(repository, succeeding_llm).run_turn(conv.id, "second"):
+    async for _ in await ChatService(repository, succeeding_llm).run_turn(conv.id, "second"):
         pass
 
     sent_contents = [m["content"] for m in succeeding_llm.calls[0]]
     assert sent_contents == ["first", "second"]  # the failed assistant reply is excluded
+
+
+async def test_interrupted_turns_are_also_excluded_from_history(repository):
+    """The filter is `status == "complete"`, so this follows from the same line
+    as the `failed` case — but it's the half a reader is likelier to doubt: a
+    half-finished sentence from a stopped stream is exactly the kind of thing
+    that quietly poisons every later turn if it's fed back to the model.
+    """
+    conv = await repository.create_conversation(title="t", model="fake")
+    await repository.insert_message(conv.id, "user", "first", "complete")
+    await repository.insert_message(conv.id, "assistant", "half a sen", "interrupted")
+
+    llm = FakeLLMClient(chunks=[LLMChunk(text="ok")])
+    async for _ in await ChatService(repository, llm).run_turn(conv.id, "second"):
+        pass
+
+    assert [m["content"] for m in llm.calls[0]] == ["first", "second"]
 
 
 async def test_missing_conversation_raises_before_calling_the_llm(repository):
@@ -128,18 +200,18 @@ async def test_missing_conversation_raises_before_calling_the_llm(repository):
     service = ChatService(repository, llm)
 
     with pytest.raises(ConversationNotFound):
-        async for _ in service.run_turn("000000000000000000000000", "hi"):
+        async for _ in await service.run_turn("000000000000000000000000", "hi"):
             pass
 
     assert llm.calls == []
 
 
-async def test_start_event_names_the_assistant_id_before_it_is_persisted(repository):
+async def test_start_event_names_the_assistant_row_written_before_the_first_token(repository):
     conv = await repository.create_conversation(title="t", model="fake")
     llm = FakeLLMClient(chunks=[LLMChunk(text="hi")])
     service = ChatService(repository, llm)
 
-    events = [event async for event in service.run_turn(conv.id, "hi")]
+    events = [event async for event in await service.run_turn(conv.id, "hi")]
 
     start = events[0]
     done = events[-1]
@@ -148,11 +220,43 @@ async def test_start_event_names_the_assistant_id_before_it_is_persisted(reposit
     assert start.assistant_message_id == done.message.id
 
 
+async def test_the_assistant_row_is_on_disk_before_the_first_token(repository):
+    """The thesis, made structural rather than aspirational. Mid-stream — no
+    reply text generated yet, no cleanup path run, nothing finalized — the
+    database already holds an assistant row reading `interrupted`. Kill the
+    process on the very next line and the transcript is still honest. Every
+    write after this one only improves the record; none of them is what makes
+    it true.
+    """
+    conv = await repository.create_conversation(title="t", model="fake")
+
+    class BlockingLLM:
+        name = "fake"
+        model = "fake-model"
+
+        async def stream(self, messages):
+            yield LLMChunk(text="first ")
+            await asyncio.sleep(10)  # parked here for the assertions below
+
+    turn = await ChatService(repository, BlockingLLM()).run_turn(conv.id, "hi")
+    started = await anext(turn)
+
+    messages = await repository.list_messages(conv.id)
+    assert [(m.role, m.status) for m in messages] == [
+        ("user", "complete"),
+        ("assistant", "interrupted"),
+    ]
+    assert messages[-1].id == started.assistant_message_id
+    assert messages[-1].provider == "fake"
+
+    await turn.aclose()
+
+
 async def test_first_message_derives_a_title_from_its_content(repository):
     conv = await repository.create_conversation(title=DEFAULT_TITLE, model="fake")
     llm = FakeLLMClient(chunks=[LLMChunk(text="hi")])
 
-    async for _ in ChatService(repository, llm).run_turn(conv.id, "explain quicksort please"):
+    async for _ in await ChatService(repository, llm).run_turn(conv.id, "explain quicksort please"):
         pass
 
     renamed = await repository.get_conversation(conv.id)
@@ -163,7 +267,7 @@ async def test_first_message_does_not_override_an_explicit_title(repository):
     conv = await repository.create_conversation(title="my custom title", model="fake")
     llm = FakeLLMClient(chunks=[LLMChunk(text="hi")])
 
-    async for _ in ChatService(repository, llm).run_turn(conv.id, "something else entirely"):
+    async for _ in await ChatService(repository, llm).run_turn(conv.id, "something else entirely"):
         pass
 
     unchanged = await repository.get_conversation(conv.id)
@@ -174,11 +278,13 @@ async def test_retry_regenerates_without_inserting_a_new_user_message(repository
     conv = await repository.create_conversation(title="t", model="fake")
     failing_llm = FakeLLMClient(error=AppError("boom"))
     with pytest.raises(AppError):
-        async for _ in ChatService(repository, failing_llm).run_turn(conv.id, "hello"):
+        async for _ in await ChatService(repository, failing_llm).run_turn(conv.id, "hello"):
             pass
 
     succeeding_llm = FakeLLMClient(chunks=[LLMChunk(text="fixed reply")])
-    events = [event async for event in ChatService(repository, succeeding_llm).retry_turn(conv.id)]
+    events = [
+        event async for event in await ChatService(repository, succeeding_llm).retry_turn(conv.id)
+    ]
 
     messages = await repository.list_messages(conv.id)
     assert [m.role for m in messages] == ["user", "assistant"]  # no second user message
@@ -188,12 +294,87 @@ async def test_retry_regenerates_without_inserting_a_new_user_message(repository
     assert succeeding_llm.calls[0] == [{"role": "user", "content": "hello"}]
 
 
+async def test_an_interrupted_reply_is_retryable_too(repository):
+    """Stop and a closed tab both land on `interrupted`, and both are things a
+    user wants to pick back up — so /retry keys off "not complete", not off
+    "failed". Without this the Stop button would be a dead end.
+    """
+    conv = await repository.create_conversation(title="t", model="fake")
+    await repository.insert_message(conv.id, "user", "hello", "complete")
+    await repository.insert_message(conv.id, "assistant", "half a sen", "interrupted")
+
+    llm = FakeLLMClient(chunks=[LLMChunk(text="a complete reply")])
+    async for _ in await ChatService(repository, llm).retry_turn(conv.id):
+        pass
+
+    messages = await repository.list_messages(conv.id)
+    assert [m.status for m in messages] == ["complete", "complete"]
+    assert messages[-1].content == "a complete reply"
+    # The abandoned partial is gone, not left behind next to its replacement.
+    assert llm.calls[0] == [{"role": "user", "content": "hello"}]
+
+
+async def test_a_completed_reply_is_not_retryable(repository):
+    """The other side of that condition: /retry must not be a way to delete and
+    regenerate a perfectly good answer."""
+    conv = await repository.create_conversation(title="t", model="fake")
+    async for _ in await ChatService(
+        repository, FakeLLMClient(chunks=[LLMChunk(text="fine")])
+    ).run_turn(conv.id, "hello"):
+        pass
+
+    llm = FakeLLMClient(chunks=[LLMChunk(text="should never be sent")])
+    with pytest.raises(NothingToRetry):
+        async for _ in await ChatService(repository, llm).retry_turn(conv.id):
+            pass
+
+    assert llm.calls == []
+    assert (await repository.list_messages(conv.id))[-1].content == "fine"
+
+
+async def test_a_long_first_message_is_truncated_into_a_title_on_a_word_boundary(repository):
+    """Titling is a heuristic on purpose — spending one of a 50-per-day free
+    quota on a sidebar label is the wrong trade (README, decisions)."""
+    conv = await repository.create_conversation(title=DEFAULT_TITLE, model="fake")
+    long_message = (
+        "please explain in detail how mongodb index prefixes work and when a "
+        "compound index can serve a query on only its leading field"
+    )
+
+    async for _ in await ChatService(
+        repository, FakeLLMClient(chunks=[LLMChunk(text="hi")])
+    ).run_turn(conv.id, long_message):
+        pass
+
+    title = (await repository.get_conversation(conv.id)).title
+    assert title.endswith("…")
+    assert len(title) <= 61  # 60 chars plus the ellipsis
+    assert long_message.startswith(title[:-1])
+    assert not title[:-1].endswith(" ")  # cut on a word boundary, not mid-word
+
+
 async def test_retry_with_nothing_to_retry_raises_without_calling_the_llm(repository):
     conv = await repository.create_conversation(title="t", model="fake")
     llm = FakeLLMClient(chunks=[LLMChunk(text="should never be sent")])
 
     with pytest.raises(NothingToRetry):
-        async for _ in ChatService(repository, llm).retry_turn(conv.id):
+        async for _ in await ChatService(repository, llm).retry_turn(conv.id):
+            pass
+
+    assert llm.calls == []
+
+
+async def test_retry_on_an_orphaned_assistant_message_does_not_crash(repository):
+    """Dropping the trailing reply can empty the history — nothing above this
+    layer can produce that state today, but "raise NothingToRetry" and "500 on
+    an IndexError" are one line apart, and only one of them is this app's
+    promise."""
+    conv = await repository.create_conversation(title="t", model="fake")
+    await repository.insert_message(conv.id, "assistant", "orphan", "failed")
+
+    llm = FakeLLMClient(chunks=[LLMChunk(text="should never be sent")])
+    with pytest.raises(NothingToRetry):
+        async for _ in await ChatService(repository, llm).retry_turn(conv.id):
             pass
 
     assert llm.calls == []

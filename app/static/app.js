@@ -115,28 +115,30 @@ function renderSidebar() {
   }
 }
 
-function bubbleFor(message) {
+function bubbleFor(message, isLast) {
   const bubble = document.createElement("div");
   bubble.className = `bubble ${message.role === "user" ? "user" : message.status}`;
   bubble.textContent = message.content || (message.status === "failed" ? "" : "…");
 
-  if (message.status === "failed" && message.error) {
-    const meta = document.createElement("span");
-    meta.className = "meta";
-    meta.textContent = message.error.message;
-    bubble.appendChild(meta);
+  if (message.role !== "assistant" || message.status === "complete") return bubble;
 
-    const retry = document.createElement("span");
-    retry.className = "retry";
-    retry.textContent = "Retry";
-    retry.addEventListener("click", retryLast);
-    bubble.appendChild(retry);
-  } else if (message.status === "interrupted") {
-    const meta = document.createElement("span");
-    meta.className = "meta";
-    meta.textContent = "(interrupted)";
-    bubble.appendChild(meta);
-  }
+  const meta = document.createElement("span");
+  meta.className = "meta";
+  meta.textContent = message.error ? message.error.message : "(interrupted)";
+  bubble.appendChild(meta);
+
+  // Retry appears on both non-complete states, because POST /retry accepts
+  // both — it keys off "not complete", not off "failed", so offering it only
+  // on failures would make the Stop button a dead end. But only on the *last*
+  // message: /retry regenerates the trailing reply, so on an older bubble the
+  // button would either do nothing visible or rewrite someone else's turn.
+  if (!isLast) return bubble;
+
+  const retry = document.createElement("span");
+  retry.className = "retry";
+  retry.textContent = "Retry";
+  retry.addEventListener("click", retryLast);
+  bubble.appendChild(retry);
 
   return bubble;
 }
@@ -150,9 +152,9 @@ async function renderMessagesFromServer() {
     messages = []; // e.g. the conversation was deleted from another tab
   }
   els.messages.textContent = "";
-  for (const message of messages) {
-    els.messages.appendChild(bubbleFor(message));
-  }
+  messages.forEach((message, index) => {
+    els.messages.appendChild(bubbleFor(message, index === messages.length - 1));
+  });
   // Authoritative visibility, independent of whether the "start" SSE event
   // ever arrived — e.g. a send to a since-deleted conversation fails before
   // any event is sent, and this is still correct.

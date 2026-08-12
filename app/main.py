@@ -1,3 +1,4 @@
+import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -16,6 +17,34 @@ from app.routes import router
 
 STATIC_DIR = Path(__file__).parent / "static"
 
+# Uvicorn only configures its own loggers, so without this the app's lines
+# reach stderr through logging's last-resort handler — bare, level-less, and
+# easy to mistake for a stray print. The format mirrors uvicorn's so the two
+# read as one log stream.
+logging.basicConfig(level=logging.INFO, format="%(levelname)s:     %(message)s")
+
+logger = logging.getLogger("app")
+
+
+def _log_provider(llm, settings: Settings) -> None:
+    """First thing in the logs on `docker compose up`. Somebody who brings this
+    stack up without a key should learn that from the very first screenful,
+    not from a reply that sounds oddly canned ten minutes later. Never logs
+    the key itself — only whether one is present.
+    """
+    if llm.name == "demo":
+        logger.warning(
+            "Offline demo provider active — no real model is being called. "
+            "Set LLM_API_KEY in .env to talk to OpenRouter (see README)."
+        )
+    elif not settings.llm_configured:
+        logger.warning(
+            "LLM_PROVIDER=openrouter but LLM_API_KEY is unset — every message will "
+            "fail with llm_not_configured. Set the key, or use LLM_PROVIDER=demo."
+        )
+    else:
+        logger.info("Using OpenRouter with model %s.", llm.model)
+
 
 def create_app(settings: Settings | None = None) -> FastAPI:
     settings = settings or get_settings()
@@ -29,6 +58,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         app.state.repository = repository
         app.state.llm = build_llm(settings)
         app.state.chat_service = ChatService(app.state.repository, app.state.llm)
+        _log_provider(app.state.llm, settings)
 
         yield
 

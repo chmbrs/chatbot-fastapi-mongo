@@ -1,4 +1,5 @@
 import json
+from contextlib import suppress
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, Path, Request
@@ -139,7 +140,10 @@ async def send_message(
     request: Request,
     chat_service: ChatServiceDep,
 ):
-    turn = chat_service.run_turn(conversation_id, body.content)
+    # Awaited here, so setup failures (an unknown conversation) raise before a
+    # response type is chosen and come back as a real 404 on both renderers —
+    # rather than, on the SSE path, a committed 200 carrying an error frame.
+    turn = await chat_service.run_turn(conversation_id, body.content)
     if "text/event-stream" in request.headers.get("accept", ""):
         return EventSourceResponse(_render_sse(turn, request))
     return await _render_json(turn, success_status=201)
@@ -149,7 +153,7 @@ async def send_message(
 async def retry_message(
     conversation_id: ConversationId, request: Request, chat_service: ChatServiceDep
 ):
-    turn = chat_service.retry_turn(conversation_id)
+    turn = await chat_service.retry_turn(conversation_id)
     if "text/event-stream" in request.headers.get("accept", ""):
         return EventSourceResponse(_render_sse(turn, request))
     return await _render_json(turn, success_status=200)
@@ -162,7 +166,14 @@ async def _render_sse(turn, request: Request):
     an AppError can be raised here, `start` (and possibly `delta`) events
     may already be on the wire, so the HTTP status is already committed —
     this is the one AppError path that can't just propagate to the global
-    handler in main.py, which is why it's caught here instead."""
+    handler in main.py, which is why it's caught here instead.
+
+    Nothing here has to run for the turn to be persisted honestly — see
+    chat.py: the assistant row is already on disk, reading `interrupted`,
+    before the first frame below is written. That is deliberate. An earlier
+    version made this function's cleanup path load-bearing, and a disconnect
+    would then race async-generator finalization and lose the message.
+    """
     try:
         async for event in turn:
             if isinstance(event, TurnStarted):
@@ -186,6 +197,16 @@ async def _render_sse(turn, request: Request):
     except AppError as exc:
         request_id = getattr(request.state, "request_id", None)
         yield {"event": "error", "data": json.dumps(error_envelope(exc, request_id)["error"])}
+    finally:
+        # On a disconnect this generator is torn down while `turn` is still
+        # mid-reply; closing it explicitly is what lets chat.py record the
+        # partial text alongside the `interrupted` state it already wrote.
+        # Strictly an improvement to the record, never what makes it correct —
+        # so a RuntimeError here (raised when something else is already
+        # closing the same generator, which then does this same work) is
+        # swallowed rather than turned into a traceback in the logs.
+        with suppress(RuntimeError):
+            await turn.aclose()
 
 
 async def _render_json(turn, success_status: int) -> JSONResponse:

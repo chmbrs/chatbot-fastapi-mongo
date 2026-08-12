@@ -5,9 +5,14 @@ test_chat.py; this file is about the routes wiring: status codes, id
 validation, the dual JSON/SSE renderer, and health reporting.
 """
 
+import json
+
+from fastapi.testclient import TestClient
+
 from app.chat import ChatService
-from app.errors import AppError
+from app.errors import AppError, RateLimited
 from app.llm.base import LLMChunk
+from app.main import create_app
 from tests.fakes import FakeLLMClient
 
 
@@ -21,6 +26,28 @@ def test_health_is_always_200_and_reports_demo_provider(client):
     assert body["llm"]["provider"] == "demo"
     assert body["llm"]["configured"] is False
     assert "demo" in body["llm"]["degraded_reason"]
+
+
+def test_health_is_still_200_when_mongo_is_unreachable(client, monkeypatch):
+    """The load-bearing half of "always 200": a health endpoint that 503s when
+    its database is down turns a degraded stack into a flapping container under
+    Docker's HEALTHCHECK, which is the opposite of what this app promises.
+    Repository.ping already swallows PyMongoError into False — what's pinned
+    here is that the route does something sane with that False.
+    """
+
+    async def ping_fails() -> bool:
+        return False
+
+    monkeypatch.setattr(client.app.state.repository, "ping", ping_fails)
+
+    response = client.get("/api/health")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "degraded"
+    assert body["mongo"] == "unreachable"
+    assert body["llm"]["degraded_reason"] == "mongo is unreachable"
 
 
 def test_create_list_get_delete_conversation_round_trip(client):
@@ -110,6 +137,79 @@ def test_send_message_sse_mode_streams_start_delta_and_done_events(client):
     assert "event: start" in body
     assert "event: delta" in body
     assert "event: done" in body
+
+
+def test_send_message_sse_mode_reports_failure_as_an_error_event_not_an_http_status(client):
+    """The streaming half of the failure story. By the time the provider fails,
+    `start` (and possibly `delta`) frames are already on the wire and HTTP 200
+    is committed — so the failure has to arrive as an SSE `error` event carrying
+    the same envelope the JSON renderer would have returned. This is what the
+    UI's red bubble and its Retry button are built on.
+    """
+    created = client.post("/api/conversations", json={})
+    conversation_id = created.json()["id"]
+
+    repository = client.app.state.repository
+    client.app.state.chat_service = ChatService(
+        repository,
+        FakeLLMClient(
+            chunks=[LLMChunk(text="partial ")], error=RateLimited(retry_after_seconds=30)
+        ),
+    )
+
+    with client.stream(
+        "POST",
+        f"/api/conversations/{conversation_id}/messages",
+        json={"content": "hi"},
+        headers={"accept": "text/event-stream"},
+    ) as response:
+        assert response.status_code == 200  # already committed before the failure
+        body = "".join(response.iter_text())
+
+    assert "event: delta" in body
+    assert "event: error" in body
+    assert "event: done" not in body
+
+    error = json.loads(
+        next(
+            block.split("data:", 1)[1]
+            for block in body.replace("\r\n", "\n").split("\n\n")
+            if "event: error" in block
+        )
+    )
+    assert error["code"] == "rate_limited"
+    assert error["retry_after_seconds"] == 30
+    assert error["request_id"]
+
+    # And the partial text is persisted as `failed`, not lost.
+    messages = client.get(f"/api/conversations/{conversation_id}/messages").json()
+    assert messages[-1]["status"] == "failed"
+    assert messages[-1]["content"] == "partial "
+
+
+def test_conversations_and_messages_survive_a_restart(app_settings):
+    """The brief's one hard persistence requirement. Two independent app
+    instances over the same database — new FastAPI app, new Mongo client, new
+    lifespan — which is what `docker compose down && docker compose up` is, given
+    the named `mongo_data` volume. Deliberately not a mock of a restart: the
+    second boot re-runs ensure_indexes against a database that already has them,
+    so this also pins that startup is idempotent.
+    """
+    with TestClient(create_app(app_settings)) as first_boot:
+        conversation_id = first_boot.post("/api/conversations", json={}).json()["id"]
+        first_boot.post(
+            f"/api/conversations/{conversation_id}/messages", json={"content": "remember me"}
+        )
+
+    with TestClient(create_app(app_settings)) as second_boot:
+        conversations = second_boot.get("/api/conversations").json()
+        assert [c["id"] for c in conversations] == [conversation_id]
+        assert conversations[0]["title"] == "remember me"  # derived title survived too
+
+        messages = second_boot.get(f"/api/conversations/{conversation_id}/messages").json()
+        assert [m["role"] for m in messages] == ["user", "assistant"]
+        assert messages[0]["content"] == "remember me"
+        assert messages[1]["status"] == "complete"
 
 
 def test_retry_regenerates_the_last_failed_reply(client):
