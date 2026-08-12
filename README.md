@@ -40,9 +40,17 @@ message the other. It works in demo mode, with no API key, no signup, nothing.
 This is a small, playable port of Claude Code's own
 [cross-session messaging](https://code.claude.com/docs/en/cross-session-messaging) onto
 this app's conversations. Every conversation gets a **handle**, derived from its title
-and id, e.g. `payments-api-3f0a`, shown under the conversation's name, and can message
+and id, e.g. `payments-api-3f0a`, listed beside every chat in the sidebar, and can message
 another conversation by that handle. Click the 🛰 icon next to a conversation's title, or
-just type `@handle your message` into the chat box.
+type `@payments your message` into the chat box.
+
+The `@` shortcut takes any unambiguous prefix or fragment of a handle or title, so
+`@payments` reaches `payments-api-3f0a` without anyone having to retype an id suffix; two
+candidates is an error listing both rather than a guess at which one was meant. Anything
+starting with `@` is treated as a send attempt and never quietly re-routed to the model:
+a handle that doesn't resolve, or a mention with no message after it, says so and names
+the conversations that *are* reachable. Silently answering `@typo hello` as an ordinary
+prompt was the single thing that made this feature look broken rather than misaddressed.
 
 ```bash
 A=$(curl -s -X POST localhost:8000/api/conversations -d '{"title":"a"}' -H 'content-type: application/json' | python3 -c "import sys,json;print(json.load(sys.stdin)['id'])")

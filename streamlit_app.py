@@ -128,8 +128,76 @@ def _sidebar_label(title: str, limit: int = 28) -> str:
     return truncated + "…"
 
 
+def _addressable(conversations: list[dict], self_id: str | None) -> list[dict]:
+    """Everything the current conversation can send to: the roster minus
+    itself. Mirrors app/peers.py's resolve_handle, which scans the same
+    list_conversations() this UI renders, so what looks addressable here is
+    exactly what is addressable there."""
+    return [c for c in conversations if c["id"] != self_id]
+
+
+def _resolve_mention(token: str, conversations: list[dict], self_id: str | None):
+    """Turns what someone actually typed after `@` into a full handle, or
+    into a sentence explaining why it didn't resolve. Returns
+    (handle, error) with exactly one of the two set.
+
+    A handle is `slug(title)[:24]-<last 4 of the id>` (app/models.py), which
+    nobody types from memory, so an exact match can't be the only thing that
+    works. Prefix and then substring matching let `@second` reach
+    `second-chat-3f9a` while the request sent to the backend is still the
+    canonical handle: the resolution is a UI affordance, and /send stays
+    strict about what it accepts.
+
+    Ambiguity is an error, never a guess. Two chats titled alike differ only
+    in the id suffix, and silently picking one of them would be the same
+    failure mode this whole function exists to remove.
+    """
+    others = _addressable(conversations, self_id)
+    if not others:
+        return None, "There's no other conversation to message yet. Start a second chat first."
+
+    needle = token.lower().lstrip("@")
+    if not needle:
+        return None, "Name a conversation after the @, for example @" + others[0]["handle"] + "."
+
+    for candidate in others:
+        if candidate["handle"] == needle:
+            return candidate["handle"], None
+
+    prefix = [c for c in others if c["handle"].startswith(needle)]
+    matches = prefix or [c for c in others if needle in c["handle"] or needle in c["title"].lower()]
+
+    if len(matches) == 1:
+        return matches[0]["handle"], None
+    if len(matches) > 1:
+        listed = ", ".join(f"@{c['handle']}" for c in matches)
+        return None, f"@{needle} matches more than one conversation: {listed}. Be more specific."
+
+    # Self-addressing is worth naming on its own: it is a different mistake
+    # from a typo, and the backend rejects it too (CannotMessageSelf).
+    if self_id is not None:
+        current = next((c for c in conversations if c["id"] == self_id), None)
+        if current and (current["handle"].startswith(needle) or needle in current["title"].lower()):
+            return None, "That's this conversation. Pick a different one to message."
+
+    listed = ", ".join(f"@{c['handle']}" for c in others[:5])
+    return None, f"No conversation matches @{needle}. You can reach: {listed}"
+
+
+def _composer_hint(conversations: list[dict], self_id: str | None) -> str:
+    """The placeholder is the only teaching surface the composer has, so it
+    names a real, current handle instead of the literal word "handle", which
+    read as an instruction to type "handle"."""
+    others = _addressable(conversations, self_id)
+    if not others:
+        return "Message this chat"
+    return f"Message this chat, or @{others[0]['handle']} to send to another chat"
+
+
 def _set_conversation(conversation_id: str | None) -> None:
     st.session_state.conversation_id = conversation_id
+    st.session_state.peer_notice = None
+    st.session_state.peer_error = None
     if conversation_id is None:
         st.query_params.clear()
     else:
@@ -182,8 +250,11 @@ def _peer_popover(conversation: dict, conversations: list[dict]) -> None:
     doesn't compete for room in a header that has none to spare (see
     _sidebar_label's docstring on why: this file has no layout="wide")."""
     policy = st.segmented_control(
-        "Inbound",
+        "When another chat messages this one",
         options=["accept", "hold", "refuse"],
+        # The stored values are the backend's contract (app/models.py's
+        # InboundPolicy); only the labels are softened.
+        format_func={"accept": "Reply", "hold": "Ask me", "refuse": "Block"}.get,
         default=conversation["inbound"],
         key=f"inbound-{conversation['id']}",
     )
@@ -192,13 +263,17 @@ def _peer_popover(conversation: dict, conversations: list[dict]) -> None:
         st.rerun()
 
     st.divider()
-    others = [c for c in conversations if c["id"] != conversation["id"]]
+    others = _addressable(conversations, conversation["id"])
     if not others:
         st.caption("Create a second conversation to message it.")
     else:
+        # Chosen by title, sent by handle: nobody recognizes a chat by its
+        # slug-plus-id-suffix, but that is what /send needs.
+        by_handle = {c["handle"]: c for c in others}
         to_handle = st.selectbox(
             "Send to",
-            options=[c["handle"] for c in others],
+            options=list(by_handle),
+            format_func=lambda h: f"{_sidebar_label(by_handle[h]['title'])}  ·  @{h}",
             key=f"peer-to-{conversation['id']}",
         )
         text = st.text_area("Message", key=f"peer-text-{conversation['id']}")
@@ -239,9 +314,16 @@ def _watch_for_peer_activity(conversation_id: str) -> None:
     except (TurnFailed, IndexError):
         return  # a poll that fails is not an error the user caused
     seen = (latest["id"], latest["status"])
-    if st.session_state.last_seen not in (None, seen):
+    # Record what was seen *before* rerunning, not after: st.rerun() raises
+    # immediately, so an assignment placed after it never runs, last_seen
+    # stays stale, and the next pass sees the same change and reruns again --
+    # a hot loop that repaints forever. Worse, this fragment is reached
+    # before st.chat_input below, so every one of those aborted passes skips
+    # the composer: the symptom is not a busy app but an app that silently
+    # swallows everything typed into it once a peer reply lands.
+    previous, st.session_state.last_seen = st.session_state.last_seen, seen
+    if previous not in (None, seen):
         st.rerun()  # app scope: the sidebar's ordering can have changed too
-    st.session_state.last_seen = seen
 
 
 if "conversation_id" not in st.session_state:
@@ -251,6 +333,8 @@ if "conversation_id" not in st.session_state:
 st.session_state.setdefault("pending_retry", None)
 st.session_state.setdefault("streaming", False)
 st.session_state.setdefault("last_seen", None)
+st.session_state.setdefault("peer_notice", None)
+st.session_state.setdefault("peer_error", None)
 
 try:
     health = api("GET", "/api/health")
@@ -317,9 +401,18 @@ with st.sidebar:
             on_click=_delete_conversation,
             args=(conversation["id"],),
         )
+        # The address, next to the thing it addresses. Without this the only
+        # place a handle appeared was a caption for the chat you were already
+        # in, which is the one chat you can't message.
+        row[0].caption(f"@{conversation['handle']}")
 
 
 # --- main pane ---------------------------------------------------------------
+
+# Both are read by the composer block at the bottom, which also runs on the
+# pass where no conversation is selected yet and nothing below was rendered.
+messages: list[dict] = []
+live_turn = None
 
 if conversation_id is None:
     st.info("Send a message to start a new conversation.")
@@ -355,8 +448,37 @@ else:
     # free (see st.container's docs) -- which matters more here than in a
     # single-user chat, since a peer exchange can add several rows in the
     # time it takes to glance away and back.
-    with st.container(height=450):
+    #
+    # border=False: a fixed-height container draws a box by default, and that
+    # box read as a divider cutting the conversation in two -- especially
+    # while a turn was streaming, since the live turn used to render below it
+    # (see live_turn). The scroll behavior is what's wanted here, not the
+    # frame around it.
+    with st.container(height=450, border=False):
         messages = api("GET", f"/api/conversations/{conversation_id}/messages")
+
+        # A send to a peer is recorded in the *receiving* conversation only
+        # (app/routes.py's send_peer_message), so without this the sender's
+        # own transcript never shows what it sent, and the peer's reply --
+        # which forwards back here -- arrives with no visible question above
+        # it. Session state, not the database: no schema change, and it stays
+        # honest about being a client-side trace by not surviving a reload.
+        notice = st.session_state.peer_notice
+        if notice and notice["conversation_id"] != conversation_id:
+            notice = None
+
+        def _render_notice() -> None:
+            with st.chat_message("user", avatar="🛰"):
+                st.caption(f"sent to @{notice['to_handle']} · {notice['outcome']}")
+                st.markdown(notice["text"])
+
+        # Anchored to whatever the last message was when the send happened, so
+        # it sits above the reply it prompted instead of below it. Appending
+        # never shifts an earlier message's id, so the anchor stays put as the
+        # exchange volleys.
+        if notice and notice["after_message_id"] is None:
+            _render_notice()
+
         for index, message in enumerate(messages):
             avatar = "🛰" if message["role"] == "peer" else None
             with st.chat_message(message["role"], avatar=avatar):
@@ -386,6 +508,15 @@ else:
                             args=(conversation_id,),
                         )
 
+            if notice and notice["after_message_id"] == message["id"]:
+                _render_notice()
+                notice = None  # placed; don't fall through to the tail below
+
+        # The anchor is gone (the message it named was deleted) or the send
+        # predates nothing in this list: showing it last beats dropping it.
+        if notice and notice["after_message_id"] is not None:
+            _render_notice()
+
         if st.session_state.pending_retry == conversation_id:
             st.session_state.pending_retry = None
             st.session_state.streaming = True
@@ -398,34 +529,81 @@ else:
                 st.session_state.streaming = False
             st.rerun()
 
+        # Filled in below, after st.chat_input has been read. Reserving the
+        # slot here is what keeps a streaming turn inside the transcript
+        # instead of below it: the composer has to be read after the
+        # transcript renders, but its output belongs above it.
+        live_turn = st.empty()
+
+    # Directly above the composer, so a correction sits next to the box you
+    # retype in -- and, critically, *before* the polling fragment below,
+    # which calls st.rerun() the moment a peer reply lands and so ends the
+    # script pass early. Anything written after that call is not reliably
+    # reached on the pass that should have cleared it, which is exactly how a
+    # corrected send ended up still showing the previous send's complaint.
+    #
+    # An always-created st.empty() rather than a bare `if`: leaving a slot
+    # empty is what clears it; simply not drawing an element leaves the last
+    # one in place.
+    error_slot = st.empty()
+    if st.session_state.peer_error:
+        error_slot.warning(st.session_state.peer_error, icon="🛰")
+
     _watch_for_peer_activity(conversation_id)
 
-prompt = st.chat_input("Message, or @handle to reach another conversation")
+prompt = st.chat_input(_composer_hint(conversations, conversation_id))
 if prompt:
     target_id = conversation_id
     if target_id is None:
         target_id = api("POST", "/api/conversations", json={})["id"]
         _set_conversation(target_id)
+        live_turn = None  # brand-new conversation: no transcript rendered yet
 
-    handle, _, text = prompt.partition(" ")
-    known_handles = {c["handle"] for c in conversations}
-    if prompt.startswith("@") and handle[1:] in known_handles and text.strip():
-        try:
-            delivery = _send_peer_message(target_id, handle[1:], text.strip())
-            st.toast(f"{delivery['outcome']} → {handle}", icon="🛰")
-        except TurnFailed as exc:
-            st.error(str(exc))
+    # Anything starting with @ is a send attempt and is never quietly
+    # re-routed to the LLM. Falling through on a typo was the single biggest
+    # reason this feature looked broken: `@typo hello` came back as a chatbot
+    # answer about handles, with nothing to say a delivery had failed.
+    if prompt.startswith("@"):
+        token, _, text = prompt.partition(" ")
+        to_handle, error = _resolve_mention(token, conversations, target_id)
+        if error:
+            st.session_state.peer_error = error
+        elif not text.strip():
+            st.session_state.peer_error = f"Add a message after @{to_handle}, then send."
+        else:
+            st.session_state.peer_error = None
+            try:
+                delivery = _send_peer_message(target_id, to_handle, text.strip())
+                st.session_state.peer_notice = {
+                    "conversation_id": target_id,
+                    "to_handle": to_handle,
+                    "text": text.strip(),
+                    "outcome": delivery["outcome"],
+                    # `messages` is the transcript as it stood a moment ago,
+                    # before this send could have provoked a reply into it.
+                    "after_message_id": messages[-1]["id"] if messages else None,
+                }
+                st.toast(f"{delivery['outcome']} → @{to_handle}", icon="🛰")
+            except TurnFailed as exc:
+                st.session_state.peer_error = str(exc)
     else:
-        with st.chat_message("user"):
-            st.markdown(prompt)
-        st.session_state.streaming = True
-        try:
-            with st.chat_message("assistant"):
-                st.write_stream(
-                    stream_turn(f"/api/conversations/{target_id}/messages", {"content": prompt})
-                )
-        except TurnFailed as exc:
-            st.error(str(exc))
-        finally:
-            st.session_state.streaming = False
+        st.session_state.peer_error = None
+        st.session_state.peer_notice = None
+        target = live_turn.container() if live_turn is not None else st.container()
+
+        with target:
+            with st.chat_message("user"):
+                st.markdown(prompt)
+            st.session_state.streaming = True
+            try:
+                with st.chat_message("assistant"):
+                    st.write_stream(
+                        stream_turn(
+                            f"/api/conversations/{target_id}/messages", {"content": prompt}
+                        )
+                    )
+            except TurnFailed as exc:
+                st.error(str(exc))
+            finally:
+                st.session_state.streaming = False
     st.rerun()
