@@ -27,7 +27,11 @@ The standout feature is **conversations that message each other**.
 
 Watch the demo: https://github.com/user-attachments/assets/0bbdfaef-54fc-4557-bbda-bdd190bc2659
 
-However, because this is designed as a playable demo rather than a production-ready messaging queue, it deliberately excludes certain complexities:
+Check the [README-extended.md](README-extended.md) for more details and architechture.
+
+
+Disclaimr:
+Because this is designed as a playable demo rather than a production-ready messaging queue, it deliberately excludes certain complexities:
 
 * **No Message Expiry (TTL):** Held messages wait indefinitely for user action.
 * **No Cross-Machine Delivery:** All sessions and conversations exist strictly within the same database.
