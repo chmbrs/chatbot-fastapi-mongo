@@ -10,15 +10,20 @@ dependencies = [
     "openai>=1.54",
     "pydantic-settings>=2.6",
     "sse-starlette>=2.1",
+    # Used by streamlit_app.py to call this API over HTTP. That's a separate
+    # process, not an import of app/, but one dependency set for the whole
+    # repo is simpler than a second pyproject.toml for one UI script.
+    "httpx>=0.27",
+    "streamlit>=1.50",
 ]
 
 [dependency-groups]
 dev = [
     "pytest>=8.3",
     "pytest-asyncio>=0.24",
-    "httpx>=0.27",
     # starlette's TestClient prefers httpx2 and warns without it; the openai
-    # SDK's own transport (used in test_llm_openrouter.py) still needs plain httpx.
+    # SDK's own transport (used in test_llm_openai_compatible.py) still needs
+    # plain httpx, which is now a main dependency (see above) rather than dev-only.
     "httpx2>=2.0",
     "ruff>=0.7",
 ]
@@ -33,6 +38,6 @@ select = ["E", "F", "I", "UP", "B", "FAST"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
-# This is an application, not a packaged library — no build backend, so pytest
+# This is an application, not a packaged library, so there's no build backend, and pytest
 # needs to be told the rootdir is importable rather than relying on installation.
 pythonpath = ["."]

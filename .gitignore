@@ -1,4 +1,4 @@
-# Secrets — never commit real credentials
+# Secrets: never commit real credentials
 .env
 .env.*
 !.env.example

@@ -7,7 +7,7 @@ down:
 	docker compose down
 
 logs:
-	docker compose logs -f api
+	docker compose logs -f api web
 
 test:
 	# --build is not optional: the test image bakes in tests/ and app/, so

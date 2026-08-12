@@ -1,7 +1,6 @@
 import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from pathlib import Path
 from uuid import uuid4
 
 from fastapi import FastAPI, Request
@@ -15,10 +14,8 @@ from app.llm import build_llm
 from app.repository import Repository, create_client
 from app.routes import router
 
-STATIC_DIR = Path(__file__).parent / "static"
-
 # Uvicorn only configures its own loggers, so without this the app's lines
-# reach stderr through logging's last-resort handler — bare, level-less, and
+# reach stderr through logging's last-resort handler, bare and level-less,
 # easy to mistake for a stray print. The format mirrors uvicorn's so the two
 # read as one log stream.
 logging.basicConfig(level=logging.INFO, format="%(levelname)s:     %(message)s")
@@ -30,16 +27,16 @@ def _log_provider(llm, settings: Settings) -> None:
     """First thing in the logs on `docker compose up`. Somebody who brings this
     stack up without a key should learn that from the very first screenful,
     not from a reply that sounds oddly canned ten minutes later. Never logs
-    the key itself — only whether one is present.
+    the key itself, only whether one is present.
     """
     if llm.name == "demo":
         logger.warning(
-            "Offline demo provider active — no real model is being called. Set "
+            "Offline demo provider active, no real model is being called. Set "
             "LLM_API_KEY for OpenRouter, or LLM_PROVIDER=ollama for a local model."
         )
     elif not settings.llm_configured:
         logger.warning(
-            "LLM_PROVIDER=openrouter but LLM_API_KEY is unset — every message will "
+            "LLM_PROVIDER=openrouter but LLM_API_KEY is unset, so every message will "
             "fail with llm_not_configured. Set the key, or use LLM_PROVIDER=demo."
         )
     elif llm.name == "ollama":
@@ -88,7 +85,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         request: Request, exc: RequestValidationError
     ) -> JSONResponse:
         request_id = getattr(request.state, "request_id", None)
-        # exc.errors() only — str(exc) includes an internal traceback with
+        # exc.errors() only: str(exc) includes an internal traceback with
         # file paths and line numbers, which has no business in a response body.
         details = "; ".join(
             f"{'.'.join(str(p) for p in err['loc'])}: {err['msg']}" for err in exc.errors()
@@ -106,10 +103,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         )
 
     app.include_router(router)
-    # frontend() serves these as low-priority routes: API routes always take
-    # precedence regardless of registration order. Same container, same
-    # origin, so no CORS and no second service.
-    app.frontend("/", directory=STATIC_DIR)
+    # No static mount: the UI is streamlit_app.py, a separate process that
+    # talks to this API over HTTP. This app now serves the API only:
+    # `/` 404s, `/docs` is FastAPI's own Swagger UI.
     return app
 
 

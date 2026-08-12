@@ -1,0 +1,44 @@
+# Theming only, no injected CSS anywhere in this app. Every knob here is a
+# first-class Streamlit config option, so it stays inside Streamlit's own
+# supported surface (upgrades safely, no DOM to fight, no XSS surface added).
+#
+# The goal is the *philosophy* behind calm, well-made software: restraint,
+# one deliberate accent color, generous whitespace via layout choices in
+# streamlit_app.py, quiet hairline borders instead of heavy dividers, not a
+# skin. `font = "sans-serif"` in particular renders as each visitor's own
+# platform UI font rather than importing one, which is the most "native"
+# choice available here, not a workaround.
+
+[theme]
+font = "sans-serif"
+showSidebarBorder = true
+showWidgetBorder = true
+baseRadius = "0.75rem"
+
+[theme.light]
+primaryColor = "#4F6BFF"
+backgroundColor = "#FFFFFF"
+secondaryBackgroundColor = "#F2F2F5"
+textColor = "#111827"
+borderColor = "#E2E2E7"
+
+[theme.light.sidebar]
+backgroundColor = "#F7F7F9"
+secondaryBackgroundColor = "#EFEFF2"
+
+[theme.dark]
+primaryColor = "#7C8CFF"
+backgroundColor = "#0B0B0F"
+secondaryBackgroundColor = "#17171C"
+textColor = "#F2F2F5"
+borderColor = "#2C2C33"
+
+[theme.dark.sidebar]
+backgroundColor = "#111114"
+secondaryBackgroundColor = "#1B1B20"
+
+[client]
+# Hides Streamlit's own Deploy/GitHub/dev-cloud chrome, noise that has
+# nothing to do with this app, and the first thing to clear out of the way
+# for something meant to feel like a finished product rather than a script.
+toolbarMode = "viewer"
