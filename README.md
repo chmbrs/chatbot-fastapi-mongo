@@ -1,7 +1,8 @@
 # chatbot-fastapi-mongo
 
 A chatbot: FastAPI backend, MongoDB persistence, a vanilla HTML/JS frontend, and an
-OpenAI-compatible model behind a one-method interface (OpenRouter's free tier by default).
+OpenAI-compatible model behind a one-method interface — OpenRouter's free tier by
+default, a local Ollama model if you'd rather not use a key at all.
 
 **Every turn ends in a state the server chose and persisted — `complete`, `interrupted`,
 or `failed`.** There is no configuration of this stack, including no API key at all, in
@@ -43,6 +44,35 @@ afterthought (see [Failure modes](#failure-modes)).
 The banner disappears, `/api/health` reports `"status": "ok"`, and replies stream from the
 real model. `.env` is gitignored and no key is ever logged or included in an error message.
 
+## Or run the model locally, with no key at all
+
+If you'd rather not sign up for anything — or you've burned through the 50/day — point the
+app at [Ollama](https://ollama.com) instead. No key, no quota, no data leaving the machine:
+
+```bash
+ollama pull llama3.2
+```
+
+Then set `LLM_PROVIDER=ollama` in `.env` and `docker compose up`. That's the whole change:
+Ollama speaks the same OpenAI-compatible protocol, so it reuses the same client — providers
+here are configuration, not classes.
+
+Three things worth knowing:
+
+- **`auto` will never pick Ollama.** It is opt-in only. Silently routing a conversation to
+  a different model than the one configured is the same failure as silently falling back to
+  the fake, and this app doesn't do either.
+- **Prefer a non-reasoning instruct model.** Reasoning models (`qwen3.5`, `deepseek-r1`)
+  stream their thinking into a separate `reasoning` field and leave `content` empty until
+  it finishes — over an OpenAI-compatible stream that is indistinguishable from a hang, for
+  however long the model thinks. I hit this with `qwen3.5:4b`, which is why the default is
+  `llama3.2`.
+- **The first message is slow**, because Ollama loads the model into RAM on demand. The
+  client allows 300s for Ollama against 60s for hosted providers, for exactly that reason.
+
+If Ollama isn't running, or the model isn't pulled, you get told which — see
+[Failure modes](#failure-modes).
+
 ## Verify it works
 
 Eight checks, in the order I'd run them:
@@ -53,7 +83,7 @@ Eight checks, in the order I'd run them:
 | 2 | `curl -s localhost:8000/api/health` | `200`, `"status": "degraded"`, `"configured": false`, and a `degraded_reason` naming the fix |
 | 3 | Add a real key, restart | Banner gone, `"status": "ok"`, replies stream from the model |
 | 4 | `docker compose down && docker compose up -d` | Conversations still there. (`down`, never `down -v` — the data lives in the `mongo_data` volume) |
-| 5 | `make test` | 62 passing, **with no API key set** — that green is the proof the suite is hermetic |
+| 5 | `make test` | 67 passing, **with no API key set** — that green is the proof the suite is hermetic |
 | 6 | Set `LLM_API_KEY=garbage`, send a message | Red bubble: "The configured LLM_API_KEY was rejected…", one upstream call, no retry storm |
 | 7 | Close the tab mid-stream, reopen it | The reply is there, marked `interrupted`, with a Retry button |
 | 8 | `docker compose stop mongo`, then `curl localhost:8000/api/health` | Still `200`, `"mongo": "unreachable"` — degraded, not down |
@@ -69,10 +99,11 @@ docker compose --profile test run --rm --build tests
 ```
 routes.py  →  chat.py (ChatService)  →  repository.py  →  MongoDB
                      ↓
-              llm/base.py (Protocol)  →  openrouter.py | demo.py
+              llm/base.py (Protocol)  →  openai_compatible.py | demo.py
+                                       (openrouter, ollama)
 ```
 
-Eleven Python modules, about 1,100 lines including the comments — plus ~550 lines of
+Eleven Python modules, about 1,200 lines including the comments — plus ~550 lines of
 dependency-free HTML, CSS and JavaScript. Small enough to read in one sitting, which is
 the point.
 
@@ -85,6 +116,10 @@ the point.
 - **`llm/base.py`** is the one Protocol in the codebase, and it earns its ~20 lines three
   times over: it's the test seam, the zero-key degradation seam, and the thing that shows
   dependency inversion at a glance.
+- **`llm/openai_compatible.py`** is one class serving both OpenRouter and Ollama, because
+  there is nothing to differentiate: same wire protocol, and only a base URL, a model name,
+  a timeout, and whether a key is required actually vary. Providers are configuration, not
+  subclasses — adding the third one was a `build_llm` branch, not a file.
 
 The frontend is served by the same container at the same origin, so there is no CORS
 configuration and no second service to run.
@@ -192,16 +227,24 @@ variable with no default.
 |---|---|---|
 | `MONGO_URI` | `mongodb://mongo:27017` | |
 | `MONGO_DB` | `chatbot` | |
-| `LLM_PROVIDER` | `auto` | `auto` \| `openrouter` \| `demo` |
+| `LLM_PROVIDER` | `auto` | `auto` \| `openrouter` \| `ollama` \| `demo` |
 | `LLM_API_KEY` | *(none)* | The only setting with no default. Blank is treated as unset. |
 | `LLM_BASE_URL` | `https://openrouter.ai/api/v1` | Any OpenAI-compatible endpoint |
 | `LLM_MODEL` | `google/gemma-4-26b-a4b-it:free` | |
+| `OLLAMA_BASE_URL` | `http://host.docker.internal:11434/v1` | Only read when `LLM_PROVIDER=ollama` |
+| `OLLAMA_MODEL` | `llama3.2` | |
+
+Ollama gets its own base-URL and model rather than reusing `LLM_BASE_URL`/`LLM_MODEL`, so
+that switching providers is one variable instead of three — and so an Ollama run can't
+default to an OpenRouter model id that no local install has.
 
 `LLM_PROVIDER` resolves **one-directionally: a present key always wins.** `auto` with a key
 uses OpenRouter; `auto` without one uses the demo provider; `demo` always uses the demo
 provider even if a key is present; `openrouter` always uses OpenRouter and fails per-turn
-with a named error if no key is set. The app never silently prefers the fake — a reviewer
-who suspects the integration was faked has already failed the submission.
+with a named error if no key is set; `ollama` always uses the local endpoint and needs no
+key at all. The app never silently prefers the fake, and `auto` never reaches for a local
+model on its own — a reviewer who suspects the integration was faked has already failed the
+submission.
 
 ## Failure modes
 
@@ -213,8 +256,10 @@ Every row here has a test.
 | No key, `LLM_PROVIDER=openrouter` | `llm_not_configured` | 503 | `failed` |
 | Rejected key | `invalid_key` | 502 | `failed` |
 | Free-tier limit reached | `rate_limited` | 429 | `failed` + `retry_after_seconds` |
+| Model not pulled / unknown model id | `model_not_available` | 502 | `failed` |
+| Ollama not running, or provider unreachable | `provider_unreachable` | 502 | `failed` |
 | No credits (402), upstream 5xx, mid-stream provider error | `upstream_error` | 502 | `failed` |
-| Timeout or connection failure | `upstream_error` | 502 | `failed` |
+| Timeout mid-stream | `upstream_error` | 502 | `failed` |
 | Stop button, or closed tab | — | *(connection closed)* | `interrupted` |
 | Unknown conversation id | `conversation_not_found` | 404 | — |
 | Malformed conversation id | `validation_error` | 422 | — |
@@ -348,7 +393,7 @@ make down    # stop (keeps the volume)
 
 The suite runs against a real MongoDB — a throwaway database per test, dropped on teardown —
 because the Repository boundary is exactly where a fake would stop proving anything. The LLM
-is faked at the `LLMClient` Protocol, and `tests/test_llm_openrouter.py` goes one better by
+is faked at the `LLMClient` Protocol, and `tests/test_llm_openai_compatible.py` goes one better by
 faking only the HTTP transport, so the exception mapping is verified against the real
 `openai` SDK's parsing rather than an assumption about it. An autouse fixture makes any real
 outbound HTTP request raise, and a test asserts that guard actually fires — so "green with no

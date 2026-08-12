@@ -12,7 +12,7 @@ from app.chat import DEFAULT_TITLE, ChatService, TurnDelta, TurnDone, TurnStarte
 from app.config import Settings, get_settings
 from app.errors import AppError, ConversationNotFound, error_envelope
 from app.llm.base import LLMClient
-from app.llm.openrouter import OpenRouterLLMClient
+from app.llm.openai_compatible import OpenAICompatibleLLMClient
 from app.models import Conversation, Message
 from app.repository import Repository
 
@@ -56,10 +56,15 @@ class SendMessageBody(BaseModel):
 @router.get("/api/health")
 async def health(repository: RepositoryDep, llm: LLMDep, settings: SettingsDep):
     mongo_ok = await repository.ping()
-    # isinstance, not llm.name == "openrouter": the "provider selected but no
-    # key" placeholder client also names itself "openrouter" (see llm/__init__.py)
+    # isinstance, not a name check: the "provider selected but no key"
+    # placeholder client also names itself "openrouter" (see llm/__init__.py)
     # and would otherwise be misreported as fully functional here.
-    llm_is_real = isinstance(llm, OpenRouterLLMClient)
+    #
+    # "real" means a real endpoint is configured, not that it answered — this
+    # never probes the provider. Doing so would spend a unit of a 50-per-day
+    # quota on every Docker HEALTHCHECK. A dead endpoint (wrong key, Ollama not
+    # running) surfaces on the next turn, named, rather than here.
+    llm_is_real = isinstance(llm, OpenAICompatibleLLMClient)
 
     if not mongo_ok:
         degraded_reason = "mongo is unreachable"
@@ -72,7 +77,10 @@ async def health(repository: RepositoryDep, llm: LLMDep, settings: SettingsDep):
             "LLM_PROVIDER=openrouter but no LLM_API_KEY is set — every message will fail"
         )
     else:  # "auto" with no key
-        degraded_reason = "no LLM_API_KEY configured — using the offline demo provider"
+        degraded_reason = (
+            "no LLM_API_KEY configured — using the offline demo provider "
+            "(set LLM_PROVIDER=ollama to use a local model instead)"
+        )
 
     return {
         "status": "ok" if (mongo_ok and llm_is_real) else "degraded",
@@ -87,12 +95,11 @@ async def health(repository: RepositoryDep, llm: LLMDep, settings: SettingsDep):
 
 
 @router.post("/api/conversations", status_code=201, response_model=Conversation)
-async def create_conversation(
-    body: CreateConversationBody, repository: RepositoryDep, settings: SettingsDep
-):
-    return await repository.create_conversation(
-        title=body.title or DEFAULT_TITLE, model=settings.llm_model
-    )
+async def create_conversation(body: CreateConversationBody, repository: RepositoryDep, llm: LLMDep):
+    # The resolved client's model, not settings.llm_model — those differ for
+    # every provider except OpenRouter, and this field should say what actually
+    # answered the conversation.
+    return await repository.create_conversation(title=body.title or DEFAULT_TITLE, model=llm.model)
 
 
 @router.get("/api/conversations", response_model=list[Conversation])

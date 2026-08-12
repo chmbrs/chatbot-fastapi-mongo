@@ -34,16 +34,20 @@ def _log_provider(llm, settings: Settings) -> None:
     """
     if llm.name == "demo":
         logger.warning(
-            "Offline demo provider active — no real model is being called. "
-            "Set LLM_API_KEY in .env to talk to OpenRouter (see README)."
+            "Offline demo provider active — no real model is being called. Set "
+            "LLM_API_KEY for OpenRouter, or LLM_PROVIDER=ollama for a local model."
         )
     elif not settings.llm_configured:
         logger.warning(
             "LLM_PROVIDER=openrouter but LLM_API_KEY is unset — every message will "
             "fail with llm_not_configured. Set the key, or use LLM_PROVIDER=demo."
         )
+    elif llm.name == "ollama":
+        # Names the endpoint: "connection refused" against a URL you can see is
+        # a much shorter debugging session than against one you can't.
+        logger.info("Using Ollama at %s with model %s.", settings.ollama_base_url, llm.model)
     else:
-        logger.info("Using OpenRouter with model %s.", llm.model)
+        logger.info("Using %s with model %s.", llm.name, llm.model)
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:

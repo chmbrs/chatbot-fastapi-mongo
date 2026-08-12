@@ -37,6 +37,32 @@ class InvalidApiKey(AppError):
         )
 
 
+class ProviderUnreachable(AppError):
+    code = "provider_unreachable"
+    http_status = 502
+
+    def __init__(self, base_url: str, provider: str):
+        fix = (
+            "Is Ollama running? Start it with `ollama serve`."
+            if provider == "ollama"
+            else "Check your network connection and LLM_BASE_URL."
+        )
+        super().__init__(f"Could not reach the AI provider at {base_url}. {fix}")
+
+
+class ModelNotAvailable(AppError):
+    code = "model_not_available"
+    http_status = 502
+
+    def __init__(self, model: str, provider: str):
+        fix = (
+            f"Run `ollama pull {model}`, or set OLLAMA_MODEL to a model you have."
+            if provider == "ollama"
+            else "Check LLM_MODEL against https://openrouter.ai/models."
+        )
+        super().__init__(f"The provider has no model named '{model}'. {fix}")
+
+
 class RateLimited(AppError):
     code = "rate_limited"
     http_status = 429

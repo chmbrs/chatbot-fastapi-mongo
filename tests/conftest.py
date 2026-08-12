@@ -30,9 +30,9 @@ def no_outbound_http(monkeypatch):
 
     Patched at httpx's real *transport* classes, deliberately not at the socket
     layer: Mongo is a genuine dependency of these tests and talks over a real
-    socket. `httpx.MockTransport` (test_llm_openrouter.py) and the TestClient's
+    socket. `httpx.MockTransport` (test_llm_openai_compatible.py) and the TestClient's
     in-process transport are different classes and are unaffected — only actual
-    outbound HTTP raises. tests/test_llm_openrouter.py proves this guard fires.
+    outbound HTTP raises. tests/test_llm_openai_compatible.py proves this guard fires.
     """
 
     def _blocked(*args, **kwargs):

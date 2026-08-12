@@ -1,20 +1,27 @@
 """These tests hit the real openai SDK's streaming/error-handling code —
 only the HTTP transport is faked, via httpx.MockTransport. That's a
 deliberately higher bar than mocking `client.chat.completions.create`
-directly: it proves the exception mapping in openrouter.py works against
-how the SDK actually parses OpenRouter's wire format, not against an
-assumption of it. See openrouter.py's module docstring for what that caught.
+directly: it proves the exception mapping in openai_compatible.py works
+against how the SDK actually parses the wire format, not against an assumption
+of it. See that module's docstring for what this approach caught.
 """
 
 import httpx
 import pytest
 
-from app.errors import InvalidApiKey, RateLimited, UpstreamError
-from app.llm.openrouter import OpenRouterLLMClient
+from app.errors import (
+    InvalidApiKey,
+    ModelNotAvailable,
+    ProviderUnreachable,
+    RateLimited,
+    UpstreamError,
+)
+from app.llm.openai_compatible import OpenAICompatibleLLMClient
 
 
-def _client(handler) -> OpenRouterLLMClient:
-    return OpenRouterLLMClient(
+def _client(handler, name: str = "openrouter") -> OpenAICompatibleLLMClient:
+    return OpenAICompatibleLLMClient(
+        name=name,
         api_key="test-key",
         base_url="https://example.com",
         model="m",
@@ -82,7 +89,7 @@ async def test_401_raises_invalid_api_key():
 
 
 async def test_429_raises_rate_limited_with_retry_after_seconds_and_does_not_retry():
-    """`max_retries=0` is a decision, not a default (see openrouter.py): on a
+    """`max_retries=0` is a decision, not a default (see the client): on a
     50-requests-per-day free tier, the SDK's blind backoff would spend a second
     unit of the quota to produce the same error the user sees anyway. The call
     count is the assertion that pins it — without it this test passes just as
@@ -104,6 +111,43 @@ async def test_429_raises_rate_limited_with_retry_after_seconds_and_does_not_ret
     assert attempts == 1
 
 
+async def test_missing_ollama_model_names_the_pull_command():
+    """Ollama's most common failure: the model was never pulled. The wire shape
+    is a plain 404, which would otherwise surface as "the provider returned an
+    error (HTTP 404)" — true, useless, and one `ollama pull` away from fixed.
+    """
+
+    def handler(request):
+        return httpx.Response(404, json={"error": {"message": "model 'nope' not found"}})
+
+    client = OpenAICompatibleLLMClient(
+        name="ollama",
+        api_key="ollama",
+        base_url="http://example.com",
+        model="nope",
+        http_client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+    )
+
+    with pytest.raises(ModelNotAvailable) as exc_info:
+        await _collect(client, [{"role": "user", "content": "hi"}])
+
+    assert "ollama pull nope" in exc_info.value.message
+
+
+async def test_missing_openrouter_model_points_at_the_model_list_instead():
+    """Same 404, same error type, provider-appropriate fix — an `ollama pull`
+    instruction would be nonsense here."""
+
+    def handler(request):
+        return httpx.Response(404, json={"error": {"message": "no such model"}})
+
+    with pytest.raises(ModelNotAvailable) as exc_info:
+        await _collect(_client(handler), [{"role": "user", "content": "hi"}])
+
+    assert "openrouter.ai/models" in exc_info.value.message
+    assert "ollama pull" not in exc_info.value.message
+
+
 async def test_402_no_credits_raises_upstream_error_naming_the_status():
     def handler(request):
         return httpx.Response(402, json={"error": {"message": "insufficient credits"}})
@@ -114,18 +158,25 @@ async def test_402_no_credits_raises_upstream_error_naming_the_status():
     assert "402" in exc_info.value.message
 
 
-async def test_connection_failure_raises_upstream_error():
+async def test_connection_failure_names_the_endpoint_and_the_fix():
+    """ "The provider returned an error" is false when nothing was reached, and
+    "try again in a moment" is the wrong advice when the fix is to start the
+    server. Both the URL and the remedy are provider-specific."""
+
     def handler(request):
         raise httpx.ConnectError("connection refused")
 
-    with pytest.raises(UpstreamError):
-        await _collect(_client(handler), [{"role": "user", "content": "hi"}])
+    with pytest.raises(ProviderUnreachable) as exc_info:
+        await _collect(_client(handler, name="ollama"), [{"role": "user", "content": "hi"}])
+
+    assert "https://example.com" in exc_info.value.message
+    assert "ollama serve" in exc_info.value.message
 
 
 async def test_the_suite_cannot_reach_the_network():
     """Guards the guard. Every test above fakes only the transport, so the one
     way this file could start silently spending a reviewer's free-tier quota is
-    an OpenRouterLLMClient built without a MockTransport. conftest.py's autouse
+    a client built without a MockTransport. conftest.py's autouse
     fixture makes that raise instead — this is the test that fails if that
     fixture is ever removed or renamed, rather than the suite quietly going
     live.
