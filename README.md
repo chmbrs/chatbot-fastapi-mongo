@@ -1,13 +1,15 @@
 # chatbot-fastapi-mongo
 
 ## Quickstart (No API Key Required)
-You can run the app immediately using the built-in offline demo provider. 
+You can run the app immediately using the built-in offline demo provider.
 
 1. Start the container:
-```bash
-docker compose up
-```
-2. Open the app at http://localhost:8501/. 
+
+   ```bash
+   docker compose up
+   ```
+
+2. Open the app at http://localhost:8501/.
 
 ## Using Real Models
 By default, the app uses a demo provider. You can configure it to use real cloud or local models:
@@ -23,17 +25,15 @@ By default, the app uses a demo provider. You can configure it to use real cloud
   * **Via Config:** To make it the default, set `LLM_PROVIDER=ollama` in your `.env` file and rebuild.
 
 ## Key Features & Demo Constraints
-The standout feature is **conversations that message each other**. 
+The standout feature is **conversations that message each other**.
 
 Watch the demo: https://github.com/user-attachments/assets/0bbdfaef-54fc-4557-bbda-bdd190bc2659
 
-Check the [README-extended.md](README-extended.md) for more details and architechture.
+Check [README-extended.md](README-extended.md) for more details and architecture.
 
-
-Disclaimr:
-Because this is designed as a playable demo rather than a production-ready messaging queue, it deliberately excludes certain complexities:
+**Disclaimer:** Because this is designed as a playable demo rather than a production-ready messaging queue, it deliberately excludes certain complexities:
 
 * **No Message Expiry (TTL):** Held messages wait indefinitely for user action.
 * **No Cross-Machine Delivery:** All sessions and conversations exist strictly within the same database.
-* **No Unsupervised Loops:** There are no queue caps or rate limits because automatic exchanges *strictly alternate* between the two starting conversations. 
+* **No Unsupervised Loops:** There are no queue caps or rate limits because automatic exchanges *strictly alternate* between the two starting conversations.
 * **No Streaming on `/send`:** The generated output lands in the receiving conversation, meaning there is no response for the sender to stream.
